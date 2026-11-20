@@ -1,7 +1,7 @@
-import { useState } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import Sidebar from './components/Sidebar';
 import MapView from './components/MapView';
-import { fetchWalkingRoutes } from './services/routingService';
+import { fetchWalkingRoutes, rankCandidateRoutes, refreshRouteEnvironments } from './services/routingService';
 import './App.css';
 
 export default function App() {
@@ -18,14 +18,23 @@ export default function App() {
     label: 'Tower of London',
   });
 
-  // Environmental Factor Preferences (preserved for next phase)
+  // Environmental Factor Preferences (5 factors + no_preference)
   const [preferences, setPreferences] = useState({
     air_quality: true,
-    greenery: true,
     temperature: false,
+    traffic_exposure: false,
+    greenery: true,
     walking_distance: true,
-    traffic_safety: false,
+    no_preference: false,
   });
+
+  // Departure Time selection (null = Now/Current conditions; or ISO 8601 string)
+  const [departureTime, setDepartureTime] = useState(null);
+
+  // Refresh & Re-evaluation tracking states
+  const [isRefreshingEnvironment, setIsRefreshingEnvironment] = useState(false);
+  const [lastRefreshTime, setLastRefreshTime] = useState(null);
+  const [reevaluationData, setReevaluationData] = useState(null);
 
   // Mode for clicking on the map: 'origin' | 'destination' | 'none'
   const [clickMode, setClickMode] = useState('none');
@@ -33,11 +42,58 @@ export default function App() {
   // Notification / Alert message toast
   const [notification, setNotification] = useState(null);
 
-  // Routes state
-  const [routes, setRoutes] = useState([]);
+  // Routes state: raw routes from provider vs algorithmically ranked routes
+  const [rawRoutes, setRawRoutes] = useState([]);
+  const [rankingData, setRankingData] = useState(null);
   const [selectedRouteId, setSelectedRouteId] = useState(null);
   const [isLoadingRoutes, setIsLoadingRoutes] = useState(false);
+  const [isRanking, setIsRanking] = useState(false);
   const [routeError, setRouteError] = useState(null);
+
+  // Active routes list presented to user (ranked routes when available, else raw)
+  const displayedRoutes = rankingData?.ranked_routes && rankingData.ranked_routes.length > 0
+    ? rankingData.ranked_routes
+    : rawRoutes;
+
+  // Recalculate rankings whenever selections change on existing routes
+  const executeRanking = useCallback(async (routesToRank, currentPrefs) => {
+    if (!routesToRank || routesToRank.length === 0) {
+      setRankingData(null);
+      return;
+    }
+
+    setIsRanking(true);
+    try {
+      const result = await rankCandidateRoutes({
+        routes: routesToRank,
+        preferences: currentPrefs,
+      });
+
+      if (result) {
+        setRankingData(result);
+        if (result.ranked_routes && result.ranked_routes.length > 0) {
+          // If previous selection isn't valid, select Rank 1
+          setSelectedRouteId((prevId) => {
+            const exists = result.ranked_routes.some((r) => r.id === prevId);
+            return exists ? prevId : result.ranked_routes[0].id;
+          });
+        }
+      }
+    } catch (err) {
+      console.warn('Ranking recalculation error:', err);
+    } finally {
+      setIsRanking(false);
+    }
+  }, []);
+
+  // Trigger ranking recalculation when preferences change
+  const prevPrefsRef = useRef(preferences);
+  useEffect(() => {
+    if (rawRoutes.length > 0 && JSON.stringify(prevPrefsRef.current) !== JSON.stringify(preferences)) {
+      prevPrefsRef.current = preferences;
+      executeRanking(rawRoutes, preferences);
+    }
+  }, [preferences, rawRoutes, executeRanking]);
 
   // Handle click on Leaflet map canvas
   const handleMapClick = (lat, lon) => {
@@ -49,7 +105,6 @@ export default function App() {
       setDestination({ lat, lon, label: `Selected Destination: ${formattedCoord}` });
       setClickMode('none');
     } else {
-      // If no mode active: set origin if null, otherwise set destination
       if (!origin) {
         setOrigin({ lat, lon, label: `Point A: ${formattedCoord}` });
       } else {
@@ -61,15 +116,20 @@ export default function App() {
   const handleReset = () => {
     setOrigin(null);
     setDestination(null);
-    setRoutes([]);
+    setRawRoutes([]);
+    setRankingData(null);
     setSelectedRouteId(null);
     setRouteError(null);
+    setDepartureTime(null);
+    setReevaluationData(null);
+    setLastRefreshTime(null);
     setPreferences({
       air_quality: false,
-      greenery: false,
       temperature: false,
+      traffic_exposure: false,
+      greenery: false,
       walking_distance: false,
-      traffic_safety: false,
+      no_preference: true,
     });
     setClickMode('none');
     setNotification({
@@ -79,9 +139,11 @@ export default function App() {
   };
 
   const handleClearRoutes = () => {
-    setRoutes([]);
+    setRawRoutes([]);
+    setRankingData(null);
     setSelectedRouteId(null);
     setRouteError(null);
+    setReevaluationData(null);
   };
 
   const handleCalculateRoutes = async () => {
@@ -95,25 +157,33 @@ export default function App() {
 
     setIsLoadingRoutes(true);
     setRouteError(null);
+    setReevaluationData(null);
 
     try {
       const data = await fetchWalkingRoutes({
         origin,
         destination,
         alternatives: 2,
+        departureTime,
       });
 
-      setRoutes(data.routes);
-      if (data.routes.length > 0) {
-        setSelectedRouteId(data.routes[0].id);
-        const altCount = data.routes.length - 1;
+      const parsed = data.routes || [];
+      setRawRoutes(parsed);
+
+      if (parsed.length > 0) {
+        setSelectedRouteId(parsed[0].id);
+        const altCount = parsed.length - 1;
         setNotification({
           type: 'info',
           message:
             altCount > 0
-              ? `Found ${data.routes.length} walking paths (1 primary, ${altCount} alternative${altCount > 1 ? 's' : ''}).`
+              ? `Found ${parsed.length} walking paths (1 primary, ${altCount} alternative${altCount > 1 ? 's' : ''}). Ranking applied.`
               : 'Found 1 walking route (no alternative pedestrian paths identified).',
         });
+
+        // Run multi-criteria ranking on newly calculated routes
+        await executeRanking(parsed, preferences);
+        setLastRefreshTime(new Date().toLocaleTimeString());
       } else {
         setRouteError('No walking routes returned by routing provider.');
       }
@@ -129,9 +199,46 @@ export default function App() {
     }
   };
 
+  const handleRefreshEnvironment = async () => {
+    if (rawRoutes.length === 0) return;
+
+    setIsRefreshingEnvironment(true);
+    try {
+      const refreshed = await refreshRouteEnvironments({
+        routes: rawRoutes,
+        preferences,
+        departureTime,
+        forceRefresh: true,
+      });
+
+      if (refreshed?.routes) {
+        setRawRoutes(refreshed.routes);
+        if (refreshed.ranking) {
+          setRankingData(refreshed.ranking);
+        }
+        if (refreshed.reevaluation) {
+          setReevaluationData(refreshed.reevaluation);
+        }
+        setLastRefreshTime(new Date().toLocaleTimeString());
+        setNotification({
+          type: 'info',
+          message: refreshed.reevaluation?.recommendation_change_note || 'Environmental metrics refreshed.',
+        });
+      }
+    } catch (err) {
+      console.error('Refresh error:', err);
+      setNotification({
+        type: 'warning',
+        message: err.message || 'Failed to refresh environmental conditions.',
+      });
+    } finally {
+      setIsRefreshingEnvironment(false);
+    }
+  };
+
   const handleSelectRoute = (routeId) => {
     setSelectedRouteId(routeId);
-    const chosen = routes.find((r) => r.id === routeId);
+    const chosen = displayedRoutes.find((r) => r.id === routeId);
     if (chosen) {
       setNotification({
         type: 'info',
@@ -150,15 +257,23 @@ export default function App() {
         setDestination={setDestination}
         preferences={preferences}
         setPreferences={setPreferences}
+        departureTime={departureTime}
+        setDepartureTime={setDepartureTime}
         clickMode={clickMode}
         setClickMode={setClickMode}
         onCalculateRoutes={handleCalculateRoutes}
+        onRefreshEnvironment={handleRefreshEnvironment}
+        isRefreshing={isRefreshingEnvironment}
+        lastRefreshTime={lastRefreshTime}
+        reevaluationData={reevaluationData}
         onClearRoutes={handleClearRoutes}
         onReset={handleReset}
-        routes={routes}
+        routes={displayedRoutes}
+        rankingData={rankingData}
         selectedRouteId={selectedRouteId}
         onSelectRoute={handleSelectRoute}
         isLoadingRoutes={isLoadingRoutes}
+        isRanking={isRanking}
         routeError={routeError}
       />
 
@@ -182,7 +297,7 @@ export default function App() {
           destination={destination}
           onMapClick={handleMapClick}
           clickMode={clickMode}
-          routes={routes}
+          routes={displayedRoutes}
           selectedRouteId={selectedRouteId}
           onSelectRoute={handleSelectRoute}
         />

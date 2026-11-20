@@ -23,6 +23,14 @@ class RouteRequest(BaseModel):
         le=3,
         description="Target number of alternative walking routes to request (0 to 3)"
     )
+    departure_time: Optional[str] = Field(
+        default=None,
+        description="Optional ISO 8601 departure timestamp (e.g. 2026-10-22T15:00:00Z). None defaults to immediate departure."
+    )
+    force_refresh: bool = Field(
+        default=False,
+        description="If True, bypasses local TTL cache to retrieve fresh provider data"
+    )
 
     @model_validator(mode="after")
     def validate_distinct_points(self) -> "RouteRequest":
@@ -66,6 +74,30 @@ class RouteModel(BaseModel):
     environment: Optional["RouteEnvironmentalSummary"] = Field(
         default=None,
         description="Environmental profile (air quality and temperature) associated with this route"
+    )
+    available_environmental_metrics: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Dictionary of available environmental and distance measurements"
+    )
+    metric_units: Dict[str, str] = Field(
+        default_factory=dict,
+        description="Measurement units corresponding to each available metric"
+    )
+    timestamps: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Retrieval and validity timestamps for environmental data"
+    )
+    source_metadata: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Attribution and provenance metadata for route and environmental services"
+    )
+    data_quality_status: str = Field(
+        default="complete",
+        description="Overall data completeness: 'complete', 'partial_data', or 'insufficient_data'"
+    )
+    missing_factors: List[str] = Field(
+        default_factory=list,
+        description="List of factors with missing, unrecorded, or unavailable data"
     )
 
 

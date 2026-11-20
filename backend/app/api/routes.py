@@ -7,10 +7,17 @@ from fastapi import APIRouter, Query
 from app.core.config import settings
 from app.schemas.environment import SinglePointEnvironmentResponse
 from app.schemas.geocoding import GeocodeResult
+from app.schemas.preferences import (
+    RouteRankingRequest,
+    RouteRankingResponse,
+    RouteRefreshRequest,
+    RouteRefreshResponse,
+)
 from app.schemas.routes import RouteRequest, RouteResponse
+from app.algorithm.ranking_engine import rank_routes
 from app.services.environmental_service import get_point_environmental_data
 from app.services.geocoding_service import search_locations
-from app.services.routing_service import get_walking_routes
+from app.services.routing_service import get_walking_routes, refresh_route_environments
 
 router = APIRouter()
 
@@ -61,6 +68,21 @@ async def health_check():
                 "configured": True,
                 "endpoint": settings.OVERPASS_API_URL,
             },
+            "traffic_exposure": {
+                "name": "Traffic Exposure Service",
+                "configured": True,
+                "mode": (
+                    "Live Traffic API (TomTom)"
+                    if bool(settings.TOMTOM_TRAFFIC_API_KEY and settings.TOMTOM_TRAFFIC_API_KEY.strip())
+                    else "Static Road Hierarchy Proxy (OpenStreetMap)"
+                ),
+                "is_live": bool(settings.TOMTOM_TRAFFIC_API_KEY and settings.TOMTOM_TRAFFIC_API_KEY.strip()),
+                "note": (
+                    "Optional live traffic key detected"
+                    if bool(settings.TOMTOM_TRAFFIC_API_KEY and settings.TOMTOM_TRAFFIC_API_KEY.strip())
+                    else "Operating in defensible static major-road proximity proxy mode"
+                ),
+            },
         },
     }
 
@@ -78,6 +100,21 @@ async def health_check():
 async def get_routes_endpoint(payload: RouteRequest):
     """Calculate pedestrian walking routes with alternatives."""
     return await get_walking_routes(payload)
+
+
+@router.post(
+    "/routes/refresh",
+    response_model=RouteRefreshResponse,
+    summary="Refresh Route Environmental Data and Re-evaluate",
+    description=(
+        "Refreshes environmental data (air quality, temperature, traffic, greenery) for existing "
+        "candidate routes without re-requesting ORS directions. Re-evaluates rankings against "
+        "preferences, generates change explanation, and produces data freshness provenance."
+    ),
+)
+async def refresh_routes_endpoint(payload: RouteRefreshRequest):
+    """Refresh only environmental data and re-evaluate candidate routes."""
+    return await refresh_route_environments(payload)
 
 
 @router.get(
@@ -114,3 +151,20 @@ async def get_environment_endpoint(
 ):
     """Retrieve environmental conditions from Open-Meteo for coordinates."""
     return await get_point_environmental_data(lat=lat, lon=lon, time_str=time)
+
+
+@router.post(
+    "/rank",
+    response_model=RouteRankingResponse,
+    summary="Rank Walking Routes by Multi-Criteria Preferences",
+    description=(
+        "Evaluates candidate walking routes against user-selected preferences (air quality, "
+        "temperature/heat, traffic exposure, greenery, walking distance) using a deterministic "
+        "equal-priority normalized model and formal Pareto-dominance analysis. "
+        "Eliminates manual numerical weight guessing and handles missing data transparently."
+    ),
+)
+async def rank_routes_endpoint(payload: RouteRankingRequest):
+    """Rank candidate walking routes using multi-criteria preference engine."""
+    return rank_routes(payload.routes, payload.preferences)
+

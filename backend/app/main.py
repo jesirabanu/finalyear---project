@@ -1,6 +1,6 @@
 """
 FastAPI Application Entry Point
-AI-Driven Multi-Environmental Personalized Pedestrian Routing
+AI-Driven Multi-Environmental Personalized Pedestrian Routing (EcoWalk)
 """
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware

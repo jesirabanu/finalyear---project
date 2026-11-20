@@ -1,0 +1,305 @@
+"""Tests for Greenery and Traffic Services and Ranking Integration.
+Covers:
+- OpenStreetMap Overpass greenery querying (parks, gardens, tree cover)
+- Greenery corridor buffer calculation and fraction of route length
+- Empty OSM results, malformed geometry, and Overpass timeouts (HTTP 504 / 429)
+- Disclosure that greenery buffer proximity is not equivalent to GVI or measured shade
+- Live traffic metrics vs. static road infrastructure proxy separation
+- Static road classification exposure calculation based on major road proximity
+- Verification that road classification is never labeled as live traffic
+- Integration into multi-criteria ranking engine (greenery higher-is-better, traffic lower-is-better)
+"""
+from typing import Any, Dict, List
+from unittest.mock import AsyncMock, patch
+import pytest
+from app.algorithm.ranking_engine import rank_routes
+from app.schemas.environment import (
+    AirQualityData,
+    EnvironmentalMetadata,
+    GreeneryData,
+    LiveTrafficMetrics,
+    PollutantReading,
+    RouteEnvironmentalSummary,
+    StaticRoadProxyMetrics,
+    TrafficExposureData,
+    WeatherData,
+)
+from app.schemas.preferences import PreferenceSelection
+from app.schemas.routes import RouteModel
+from app.services.greenery_service import (
+    compute_corridor_bbox,
+    compute_route_greenery_profile,
+    fetch_overpass_greenery_features,
+    haversine_distance_m,
+)
+from app.services.traffic_service import (
+    compute_route_traffic_profile,
+    fetch_live_traffic_flow,
+    fetch_overpass_major_roads,
+)
+
+
+def make_route_with_custom_env(
+    route_id: str,
+    distance_m: float = 1200.0,
+    greenery: GreeneryData = None,
+    traffic: TrafficExposureData = None,
+) -> RouteModel:
+    """Helper to construct RouteModel with explicit Greenery and Traffic objects."""
+    aq = AirQualityData(
+        european_aqi=PollutantReading(value=25.0, unit="EAQI", status="available")
+    )
+    wx = WeatherData(temperature_c=20.0, apparent_temperature_c=19.5)
+    meta = EnvironmentalMetadata(retrieval_timestamp="2026-10-22T12:00:00Z")
+
+    env = RouteEnvironmentalSummary(
+        air_quality=aq,
+        weather=wx,
+        greenery=greenery,
+        traffic_exposure=traffic,
+        metadata=meta,
+        samples_count=3,
+        has_air_quality=True,
+        has_weather=True,
+        has_greenery=greenery is not None and greenery.score is not None,
+        has_traffic=traffic is not None and traffic.score is not None,
+    )
+
+    avail_metrics = {
+        "walking_distance": distance_m,
+        "air_quality": 25.0,
+        "temperature": 19.5,
+        "greenery": greenery.score if greenery else None,
+        "traffic_exposure": traffic.score if traffic else None,
+    }
+
+    return RouteModel(
+        id=route_id,
+        name=f"Route {route_id}",
+        distance_m=distance_m,
+        distance_km=round(distance_m / 1000.0, 2),
+        duration_s=round(distance_m / 1.4, 1),
+        duration_min=round(distance_m / 84.0, 1),
+        coordinates=[
+            [51.5138, -0.0984],
+            [51.5110, -0.0870],
+            [51.5081, -0.0759],
+        ],
+        environment=env,
+        available_environmental_metrics=avail_metrics,
+        metric_units={"greenery": "%", "traffic_exposure": "index (0-100)"},
+        data_quality_status="complete",
+    )
+
+
+class TestGreeneryService:
+    """Tests for Overpass greenery proximity and corridor coverage calculation."""
+
+    def test_haversine_distance_accurate(self):
+        """Calculates distance accurately between known points."""
+        # Distance between St. Paul's (51.5138, -0.0984) and Tower of London (51.5081, -0.0759) ~ 1680m
+        dist = haversine_distance_m(51.5138, -0.0984, 51.5081, -0.0759)
+        assert 1500 < dist < 1900
+
+    def test_compute_corridor_bbox_adds_reasonable_buffer(self):
+        """Bounding box covers all coordinates plus safety buffer."""
+        r = make_route_with_custom_env("r1")
+        min_lat, min_lon, max_lat, max_lon = compute_corridor_bbox([r], buffer_deg=0.002)
+
+        assert min_lat < 51.5081
+        assert max_lat > 51.5138
+        assert min_lon < -0.0984
+        assert max_lon > -0.0759
+
+    def test_greenery_proximity_calculation_with_adjacent_parks(self):
+        """Route with mapped park in buffer calculates positive fraction, score, and park count."""
+        # Route points near 51.5110, -0.0870
+        coords = [
+            [51.5138, -0.0984],
+            [51.5110, -0.0870],
+            [51.5081, -0.0759],
+        ]
+        # Mock OSM park element centered right next to middle waypoint
+        mock_osm_elements = [
+            {
+                "type": "way",
+                "id": 1001,
+                "center": {"lat": 51.5111, "lon": -0.0871},  # ~12m away
+                "tags": {"leisure": "park", "name": "Postman's Park"},
+            }
+        ]
+
+        profile = compute_route_greenery_profile(coords, mock_osm_elements, buffer_distance_m=50.0)
+
+        assert profile.status == "available"
+        assert profile.greenery_fraction > 0.0
+        assert profile.score > 0.0
+        assert profile.parks_count == 1
+        assert profile.buffer_distance_m == 50.0
+        assert "Green View Index" in profile.limitation_note
+
+    def test_empty_osm_coverage_handled_honestly(self):
+        """Empty OSM response returns score 0.0 with empty_osm_coverage status, without crashing."""
+        coords = [[51.51, -0.09], [51.52, -0.08]]
+        profile = compute_route_greenery_profile(coords, [])
+
+        assert profile.status == "empty_osm_coverage"
+        assert profile.score == 0.0
+        assert profile.greenery_fraction == 0.0
+        assert profile.parks_count == 0
+
+    def test_overpass_timeout_or_error_preserves_null(self):
+        """When Overpass fails or returns None, score must remain None (never zero-filled)."""
+        coords = [[51.51, -0.09], [51.52, -0.08]]
+        profile = compute_route_greenery_profile(coords, None)
+
+        assert profile.status == "missing_from_provider"
+        assert profile.score is None
+        assert profile.greenery_fraction is None
+
+
+class TestTrafficService:
+    """Tests for live traffic integration, static infrastructure proxy, and separation."""
+
+    def test_separation_of_live_and_static_in_data_model(self):
+        """Data model must maintain live traffic and static proxy in distinct fields."""
+        live = LiveTrafficMetrics(
+            congestion_pct=65.0,
+            current_speed_kmh=18.0,
+            free_flow_speed_kmh=50.0,
+            status="available",
+        )
+        static = StaticRoadProxyMetrics(
+            major_road_nearby_pct=40.0,
+            dominant_road_class="primary",
+            major_roads_count=2,
+            status="available",
+        )
+
+        data = TrafficExposureData(
+            score=65.0,
+            metric_type="live_traffic_congestion",
+            is_live_measurement=True,
+            live_traffic=live,
+            static_proxy=static,
+        )
+
+        assert data.is_live_measurement is True
+        assert data.live_traffic.congestion_pct == 65.0
+        assert data.static_proxy.dominant_road_class == "primary"
+
+    def test_static_proxy_mode_when_no_live_traffic_key(self):
+        """Without a live traffic API key, engine computes static road proximity proxy and sets is_live_measurement=False."""
+        coords = [
+            [51.5138, -0.0984],
+            [51.5110, -0.0870],
+            [51.5081, -0.0759],
+        ]
+        mock_osm_roads = [
+            {
+                "type": "way",
+                "id": 2001,
+                "center": {"lat": 51.5111, "lon": -0.0871},  # ~12m from route
+                "tags": {"highway": "primary", "name": "Bishopsgate Arterial"},
+            }
+        ]
+
+        profile = compute_route_traffic_profile(coords, mock_osm_roads, live_traffic=None)
+
+        assert profile.metric_type == "static_road_hierarchy_proxy"
+        assert profile.is_live_measurement is False
+        assert profile.status == "static_proxy_estimated"
+        assert profile.score > 20.0  # Penalized due to proximity to major primary road
+        assert profile.road_class == "primary"
+        assert "Does NOT represent live vehicular traffic" in profile.limitation_note
+
+    def test_quiet_pedestrian_pathway_achieves_low_exposure_score(self):
+        """Route with no adjacent major roads receives low baseline exposure score."""
+        coords = [[51.51, -0.09], [51.52, -0.08]]
+        profile = compute_route_traffic_profile(coords, [], live_traffic=None)
+
+        assert profile.metric_type == "static_road_hierarchy_proxy"
+        assert profile.score == 15.0  # Low exposure baseline for quiet walkways
+        assert profile.road_class == "pedestrian_or_minor"
+
+    def test_traffic_provider_failure_preserves_none(self):
+        """When traffic provider and OSM both fail, score is None without inventing numbers."""
+        coords = [[51.51, -0.09], [51.52, -0.08]]
+        profile = compute_route_traffic_profile(coords, None, live_traffic=None)
+
+        assert profile.score is None
+        assert profile.status == "unavailable"
+
+
+class TestRankingIntegrationWithGreeneryAndTraffic:
+    """Verifies that selecting greenery or traffic alters rankings in the expected directions."""
+
+    def test_greenery_selection_prefers_greener_corridor(self):
+        """Higher greenery percentage must achieve higher score and Rank 1 when greenery is selected."""
+        green_profile_high = GreeneryData(
+            score=75.0,
+            unit="%",
+            status="available",
+            greenery_fraction=0.75,
+            parks_count=2,
+        )
+        green_profile_low = GreeneryData(
+            score=15.0,
+            unit="%",
+            status="available",
+            greenery_fraction=0.15,
+            parks_count=0,
+        )
+
+        r_green = make_route_with_custom_env("r_green", distance_m=1200.0, greenery=green_profile_high)
+        r_urban = make_route_with_custom_env("r_urban", distance_m=1000.0, greenery=green_profile_low)
+
+        # Select only greenery
+        res = rank_routes([r_green, r_urban], PreferenceSelection(greenery=True))
+
+        assert res.ranked_routes[0].id == "r_green"
+        assert res.ranked_routes[0].factor_details["greenery"].normalized_score == 1.0
+        assert res.ranked_routes[1].factor_details["greenery"].normalized_score == 0.0
+
+    def test_traffic_selection_prefers_quieter_corridor(self):
+        """Lower traffic exposure score must achieve higher score and Rank 1 when traffic is selected."""
+        quiet_traffic = TrafficExposureData(
+            score=20.0,
+            unit="index (0-100)",
+            status="static_proxy_estimated",
+            metric_type="static_road_hierarchy_proxy",
+            is_live_measurement=False,
+        )
+        busy_traffic = TrafficExposureData(
+            score=85.0,
+            unit="index (0-100)",
+            status="static_proxy_estimated",
+            metric_type="static_road_hierarchy_proxy",
+            is_live_measurement=False,
+        )
+
+        r_quiet = make_route_with_custom_env("r_quiet", distance_m=1200.0, traffic=quiet_traffic)
+        r_busy = make_route_with_custom_env("r_busy", distance_m=1000.0, traffic=busy_traffic)
+
+        # Select only traffic exposure
+        res = rank_routes([r_quiet, r_busy], PreferenceSelection(traffic_exposure=True))
+
+        assert res.ranked_routes[0].id == "r_quiet"
+        assert res.ranked_routes[0].factor_details["traffic_exposure"].normalized_score == 1.0
+        assert res.ranked_routes[1].factor_details["traffic_exposure"].normalized_score == 0.0
+
+    def test_missing_greenery_data_transparently_excluded(self):
+        """If greenery has no data, ranking transparently excludes it and ranks by other preferences."""
+        missing_greenery = GreeneryData(
+            score=None,
+            unit="%",
+            status="missing_from_provider",
+        )
+        r1 = make_route_with_custom_env("r1", distance_m=1000.0, greenery=missing_greenery)
+        r2 = make_route_with_custom_env("r2", distance_m=1500.0, greenery=missing_greenery)
+
+        res = rank_routes([r1, r2], PreferenceSelection(greenery=True, walking_distance=True))
+
+        assert "greenery" in res.missing_selected_factors
+        assert "walking_distance" in res.active_evaluation_factors
+        assert res.ranked_routes[0].id == "r1"

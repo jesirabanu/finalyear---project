@@ -139,13 +139,17 @@ def _build_cache_key(prefix: str, lat: float, lon: float, time_str: Optional[str
 
 
 async def fetch_air_quality_batch(
-    coords: List[Tuple[float, float]], time_str: Optional[str] = None
+    coords: List[Tuple[float, float]],
+    time_str: Optional[str] = None,
+    force_refresh: bool = False,
 ) -> List[Dict[str, Any]]:
     """Fetch air quality readings for multiple locations in a single batch query.
 
     Args:
         coords: List of (lat, lon) tuples.
         time_str: Optional ISO 8601 timestamp for historic/forecast evaluation.
+        force_refresh: If True, bypasses cache and forces upstream API call.
+                       Retains previous cache as stale fallback if API call fails.
 
     Returns:
         List of parsed JSON response objects corresponding to input coordinates.
@@ -157,20 +161,22 @@ async def fetch_air_quality_batch(
     results: List[Optional[Dict[str, Any]]] = [None] * len(coords)
     missing_indices: List[int] = []
 
-    # Check cache for each coordinate
+    # 1. Check cache for each coordinate if not forcing refresh
     for idx, (lat, lon) in enumerate(coords):
         ck = _build_cache_key("aq", lat, lon, time_str)
-        if ck in _env_cache:
+        if not force_refresh and ck in _env_cache:
             cache_time, cached_data = _env_cache[ck]
-            if now - cache_time < settings.ENVIRONMENT_CACHE_TTL_SECONDS:
-                results[idx] = cached_data
+            age = now - cache_time
+            if age < settings.ENVIRONMENT_CACHE_TTL_SECONDS:
+                results[idx] = {**cached_data, "_cache_age": age}
                 continue
         missing_indices.append(idx)
 
+    # All returned from fresh cache
     if not missing_indices:
         return [r for r in results if r is not None]
 
-    # Query uncached coordinates in a single multi-location request
+    # 2. Query uncached/refreshed coordinates in a single multi-location request
     uncached_coords = [coords[i] for i in missing_indices]
     lat_str = ",".join(str(round(c[0], 5)) for c in uncached_coords)
     lon_str = ",".join(str(round(c[1], 5)) for c in uncached_coords)
@@ -185,6 +191,8 @@ async def fetch_air_quality_batch(
     else:
         params["current"] = "pm10,pm2_5,nitrogen_dioxide,european_aqi,us_aqi"
 
+    fetch_success = False
+
     async with httpx.AsyncClient(timeout=settings.ENVIRONMENT_TIMEOUT_SECONDS) as client:
         try:
             resp = await client.get(
@@ -194,29 +202,47 @@ async def fetch_air_quality_batch(
             )
             if resp.status_code == 200:
                 raw_data = resp.json()
-                # When multiple coordinates are passed, Open-Meteo returns a list
                 items = raw_data if isinstance(raw_data, list) else [raw_data]
                 for pos, item in enumerate(items):
                     orig_idx = missing_indices[pos]
                     results[orig_idx] = item
                     ck = _build_cache_key("aq", coords[orig_idx][0], coords[orig_idx][1], time_str)
                     _env_cache[ck] = (now, item)
+                fetch_success = True
             else:
                 logger.warning(f"Open-Meteo AQI API responded with status {resp.status_code}")
         except Exception as exc:
             logger.warning(f"Failed to fetch air quality from Open-Meteo: {exc}")
 
+    # 3. If upstream fetch failed, fall back to retained cache with explicit stale warning
+    if not fetch_success:
+        for pos_idx in missing_indices:
+            ck = _build_cache_key("aq", coords[pos_idx][0], coords[pos_idx][1], time_str)
+            if ck in _env_cache:
+                cache_time, cached_data = _env_cache[ck]
+                age = now - cache_time
+                if age <= settings.STALE_DATA_MAX_AGE_SECONDS:
+                    results[pos_idx] = {
+                        **cached_data,
+                        "_is_stale": True,
+                        "_stale_warning": f"Air quality API unreachable; displaying retained cached readings ({int(age // 60)}m old).",
+                        "_cache_age": age,
+                    }
+
     return [r if r is not None else {} for r in results]
 
 
 async def fetch_weather_batch(
-    coords: List[Tuple[float, float]], time_str: Optional[str] = None
+    coords: List[Tuple[float, float]],
+    time_str: Optional[str] = None,
+    force_refresh: bool = False,
 ) -> List[Dict[str, Any]]:
     """Fetch weather data for multiple locations in a single batch query.
 
     Args:
         coords: List of (lat, lon) tuples.
         time_str: Optional ISO 8601 timestamp for forecast step matching.
+        force_refresh: If True, bypasses cache and forces upstream API call.
 
     Returns:
         List of parsed JSON response objects corresponding to input coordinates.
@@ -228,13 +254,14 @@ async def fetch_weather_batch(
     results: List[Optional[Dict[str, Any]]] = [None] * len(coords)
     missing_indices: List[int] = []
 
-    # Check cache for each coordinate
+    # 1. Check cache for each coordinate
     for idx, (lat, lon) in enumerate(coords):
         ck = _build_cache_key("weather", lat, lon, time_str)
-        if ck in _env_cache:
+        if not force_refresh and ck in _env_cache:
             cache_time, cached_data = _env_cache[ck]
-            if now - cache_time < settings.ENVIRONMENT_CACHE_TTL_SECONDS:
-                results[idx] = cached_data
+            age = now - cache_time
+            if age < settings.ENVIRONMENT_CACHE_TTL_SECONDS:
+                results[idx] = {**cached_data, "_cache_age": age}
                 continue
         missing_indices.append(idx)
 
@@ -259,6 +286,8 @@ async def fetch_weather_batch(
             "temperature_2m,relative_humidity_2m,apparent_temperature,precipitation,weather_code,wind_speed_10m"
         )
 
+    fetch_success = False
+
     async with httpx.AsyncClient(timeout=settings.ENVIRONMENT_TIMEOUT_SECONDS) as client:
         try:
             resp = await client.get(
@@ -274,10 +303,26 @@ async def fetch_weather_batch(
                     results[orig_idx] = item
                     ck = _build_cache_key("weather", coords[orig_idx][0], coords[orig_idx][1], time_str)
                     _env_cache[ck] = (now, item)
+                fetch_success = True
             else:
                 logger.warning(f"Open-Meteo Weather API responded with status {resp.status_code}")
         except Exception as exc:
             logger.warning(f"Failed to fetch weather from Open-Meteo: {exc}")
+
+    # Fallback to retained cache on failure
+    if not fetch_success:
+        for pos_idx in missing_indices:
+            ck = _build_cache_key("weather", coords[pos_idx][0], coords[pos_idx][1], time_str)
+            if ck in _env_cache:
+                cache_time, cached_data = _env_cache[ck]
+                age = now - cache_time
+                if age <= settings.STALE_DATA_MAX_AGE_SECONDS:
+                    results[pos_idx] = {
+                        **cached_data,
+                        "_is_stale": True,
+                        "_stale_warning": f"Weather forecast unreachable; displaying retained cached readings ({int(age // 60)}m old).",
+                        "_cache_age": age,
+                    }
 
     return [r if r is not None else {} for r in results]
 
@@ -473,15 +518,39 @@ def parse_weather_item(
 def compute_route_environmental_summary(
     sample_points: List[RouteEnvironmentalPoint],
     forecast_ts: Optional[str] = None,
+    departure_time: Optional[str] = None,
+    is_stale: bool = False,
+    stale_warning: Optional[str] = None,
+    cache_age_seconds: Optional[float] = None,
 ) -> RouteEnvironmentalSummary:
     """Aggregate sampled waypoint readings into a documented route summary.
 
     Averages only available non-null readings without substituting zeros for missing data.
+    Separates retrieval timestamp from forecast/observation timestamp and tracks data freshness.
     """
     now_iso = datetime.now(timezone.utc).isoformat()
+
+    # Determine if evaluating future forecast vs immediate observation
+    is_forecast = False
+    if departure_time:
+        try:
+            dep_dt = datetime.fromisoformat(departure_time.replace("Z", "+00:00"))
+            now_dt = datetime.now(timezone.utc)
+            if (dep_dt - now_dt).total_seconds() > 300.0:  # > 5 minutes in future
+                is_forecast = True
+        except Exception:
+            pass
+
     metadata = EnvironmentalMetadata(
         retrieval_timestamp=now_iso,
         forecast_timestamp=forecast_ts,
+        observation_or_forecast_timestamp=forecast_ts or now_iso,
+        is_forecast=is_forecast,
+        departure_time=departure_time,
+        is_stale=is_stale,
+        stale_warning=stale_warning,
+        cache_age_seconds=round(cache_age_seconds, 1) if cache_age_seconds else None,
+        is_cached=bool(cache_age_seconds and cache_age_seconds > 0),
     )
 
     if not sample_points:
@@ -571,6 +640,8 @@ def compute_route_environmental_summary(
         notes.append("Air quality metrics unavailable for this region/time.")
     if not valid_temp:
         notes.append("Weather metrics unavailable for this region/time.")
+    if is_stale and stale_warning:
+        notes.append(stale_warning)
 
     air_quality_summary = AirQualityData(
         pm2_5=PollutantReading(
@@ -620,17 +691,22 @@ def compute_route_environmental_summary(
         sample_points=sample_points,
         has_air_quality=bool(valid_pm25 or valid_eaqi),
         has_weather=bool(valid_temp),
+        is_stale=is_stale,
+        stale_warning=stale_warning,
         notes=notes,
     )
 
 
 async def enrich_routes_with_environmental_data(
-    routes: List[Any], time_str: Optional[str] = None
+    routes: List[Any],
+    time_str: Optional[str] = None,
+    force_refresh: bool = False,
 ) -> None:
     """Enrich candidate walking routes with sampled environmental metrics in batch.
 
     Samples points across all routes and issues unified multi-coordinate requests
     to Open-Meteo, keeping external API roundtrips minimal.
+    Supports force_refresh with automatic fallback to stale cache on network failures.
     """
     if not routes:
         return
@@ -649,9 +725,15 @@ async def enrich_routes_with_environmental_data(
         return
 
     # 2. Fetch air quality and weather concurrently in batch
-    aq_task = fetch_air_quality_batch(all_coords_to_query, time_str)
-    weather_task = fetch_weather_batch(all_coords_to_query, time_str)
+    aq_task = fetch_air_quality_batch(all_coords_to_query, time_str, force_refresh=force_refresh)
+    weather_task = fetch_weather_batch(all_coords_to_query, time_str, force_refresh=force_refresh)
     aq_results, weather_results = await asyncio.gather(aq_task, weather_task)
+
+    all_raw = aq_results + weather_results
+    is_stale = any(isinstance(r, dict) and r.get("_is_stale") for r in all_raw)
+    stale_warning = next((r.get("_stale_warning") for r in all_raw if isinstance(r, dict) and r.get("_stale_warning")), None)
+    valid_ages = [r.get("_cache_age") for r in all_raw if isinstance(r, dict) and r.get("_cache_age") is not None]
+    max_cache_age = max(valid_ages) if valid_ages else None
 
     # 3. Associate results back to each route
     cursor = 0
@@ -680,7 +762,14 @@ async def enrich_routes_with_environmental_data(
             )
             cursor += 1
 
-        summary = compute_route_environmental_summary(sample_points, forecast_ts)
+        summary = compute_route_environmental_summary(
+            sample_points,
+            forecast_ts=forecast_ts,
+            departure_time=time_str,
+            is_stale=is_stale,
+            stale_warning=stale_warning,
+            cache_age_seconds=max_cache_age,
+        )
         r.environment = summary
 
 
@@ -713,13 +802,31 @@ async def get_point_environmental_data(
     raw_aq = aq_list[0] if aq_list else {}
     raw_wx = wx_list[0] if wx_list else {}
 
+    is_stale = bool(raw_aq.get("_is_stale") or raw_wx.get("_is_stale"))
+    stale_warning = raw_aq.get("_stale_warning") or raw_wx.get("_stale_warning")
+
     aq_data, aq_ts = parse_air_quality_item(raw_aq, time_str)
     wx_data, wx_ts = parse_weather_item(raw_wx, time_str)
     now_iso = datetime.now(timezone.utc).isoformat()
 
+    is_forecast = False
+    if time_str:
+        try:
+            target_dt = datetime.fromisoformat(time_str.replace("Z", "+00:00"))
+            now_dt = datetime.now(timezone.utc)
+            if (target_dt - now_dt).total_seconds() > 300.0:
+                is_forecast = True
+        except Exception:
+            pass
+
     metadata = EnvironmentalMetadata(
         retrieval_timestamp=now_iso,
         forecast_timestamp=aq_ts or wx_ts,
+        observation_or_forecast_timestamp=aq_ts or wx_ts or now_iso,
+        is_forecast=is_forecast,
+        departure_time=time_str,
+        is_stale=is_stale,
+        stale_warning=stale_warning,
     )
 
     return SinglePointEnvironmentResponse(

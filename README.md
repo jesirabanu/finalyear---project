@@ -18,21 +18,31 @@ final - project/
 │   │   │   └── config.py              # Pydantic Settings (ORS, Nominatim, Overpass)
 │   │   ├── api/
 │   │   │   ├── __init__.py
-│   │   │   └── routes.py              # Endpoints: /api/routes, /api/geocode, /api/health
+│   │   │   └── routes.py              # Endpoints: /api/routes, /api/geocode, /api/environment, /api/rank, /api/health
 │   │   ├── schemas/
 │   │   │   ├── __init__.py
 │   │   │   ├── coordinates.py         # Bounds-validated coordinate models
 │   │   │   ├── routes.py              # Route request/response models & Leaflet coords
-│   │   │   └── geocoding.py           # Nominatim result schemas
+│   │   │   ├── geocoding.py           # Nominatim result schemas
+│   │   │   ├── environment.py         # Air quality, weather & route summary schemas
+│   │   │   └── preferences.py         # Multi-criteria preferences & ranking models
 │   │   ├── services/
 │   │   │   ├── __init__.py
 │   │   │   ├── routing_service.py     # OpenRouteService caller & alternative route parser
-│   │   │   └── geocoding_service.py   # Rate-limited & cached Nominatim geocoder
-│   │   └── algorithm/                 # Multi-criteria preference ranking engine
+│   │   │   ├── geocoding_service.py   # Rate-limited & cached Nominatim geocoder
+│   │   │   ├── environmental_service.py# Open-Meteo batch air quality & weather integration
+│   │   │   ├── greenery_service.py    # Overpass OSM greenery buffer & corridor parser
+│   │   │   └── traffic_service.py     # Live traffic flow and static major-road proxy
+│   │   └── algorithm/
+│   │       ├── __init__.py
+│   │       └── ranking_engine.py      # Transparent multi-criteria & Pareto-dominance engine
 │   ├── tests/
 │   │   ├── __init__.py
 │   │   ├── test_routes.py             # Route validation, ORS parsing, failure tests
-│   │   └── test_geocoding.py          # Geocoding validation, rate limits, error tests
+│   │   ├── test_geocoding.py          # Geocoding validation, rate limits, error tests
+│   │   ├── test_environment.py        # Air quality, weather, sampling & missing field tests
+│   │   ├── test_algorithm.py          # Factor directions, Pareto dominance, ties & proof of no fixed weights
+│   │   └── test_greenery_and_traffic.py# Overpass greenery buffer, traffic proxy, rate limits & ranking
 │   ├── requirements.txt               # Python dependencies (FastAPI, httpx, pytest, etc.)
 │   ├── .env.example                   # Environment variable template with placeholders
 │   ├── .env                           # Local environment settings
@@ -41,16 +51,20 @@ final - project/
 │   ├── src/
 │   │   ├── components/
 │   │   │   ├── MapView.jsx            # Leaflet map, route polylines, fitBounds & selection
-│   │   │   ├── Sidebar.jsx            # Geocoding search, route cards, loading/errors
-│   │   │   └── StatusBadge.jsx        # Live backend & integration health monitor
+│   │   │   ├── Sidebar.jsx            # Preferences, accessible checkboxes, route cards & trade-offs
+│   │   │   ├── RouteComparisonTable.jsx# Side-by-side multi-criteria comparison matrix
+│   │   │   ├── StatusBadge.jsx        # Live backend & integration health monitor
+│   │   │   └── EnvironmentalPanel.jsx # Route-level air quality & temperature profile panel
 │   │   ├── services/
-│   │   │   ├── routingService.js      # Decoupled backend routing API client
-│   │   │   └── geocodingService.js    # Decoupled backend geocoding API client
-│   │   ├── App.jsx                    # Application state management & interactions
-│   │   ├── App.css                    # Responsive styling & route card indicators
+│   │   │   ├── routingService.js      # Backend routing and ranking API client
+│   │   │   ├── geocodingService.js    # Decoupled backend geocoding API client
+│   │   │   └── environmentService.js  # Decoupled environmental API client
+│   │   ├── App.jsx                    # Application state management & dynamic re-ranking
+│   │   ├── App.css                    # Responsive styling & accessible comparison table
 │   │   └── main.jsx                   # React entry point
 │   ├── package.json
 │   └── vite.config.js                 # Vite config with backend API proxy (/api -> :8000)
+├── RESEARCH_GAPS.md                   # Systematic analysis of 24 papers & 5 research gaps
 └── README.md                          # Setup, execution, and testing guide
 ```
 
@@ -63,7 +77,11 @@ final - project/
 - **Backend API**: Python FastAPI, Uvicorn, Pydantic v2, HTTPX
 - **Routing Service**: OpenRouteService (ORS) Walking Directions API (`foot-walking`)
 - **Geocoding Service**: OpenStreetMap Nominatim (Backend-proxied, rate-limited to 1 req/sec, cached, with custom User-Agent)
-- **Unit & Integration Testing**: `pytest`, `pytest-asyncio`, `TestClient`
+- **Environmental Data**: Open-Meteo Air Quality (PM2.5, PM10, NO2, EAQI from Copernicus CAMS) & Forecast (Temperature, Feels-Like, Humidity, Wind from ECMWF/ICON)
+- **Greenery Presence**: OpenStreetMap Overpass API (Bounded corridor query, 50m buffer fraction & park proximity)
+- **Traffic Exposure**: Live TomTom Traffic Flow API (optional) & Defensible Static Road Hierarchy Proxy (separating live from proxy)
+- **Multi-Criteria Ranking**: Deterministic Equal-Priority Normalization with Pareto-Dominance Analysis
+- **Unit & Integration Testing**: `pytest`, `pytest-asyncio`, `TestClient` (56 automated tests passing)
 
 ---
 
@@ -143,7 +161,58 @@ Searches for location suggestions via OpenStreetMap Nominatim.
 
 ---
 
-### 3. `GET /api/health`
+### 3. `GET /api/environment?lat={lat}&lon={lon}&time={iso_time}`
+Retrieves air quality and meteorological forecast estimates from Open-Meteo for specific geographical coordinates.
+
+- **Variables Returned**:
+  - **Air Quality**: PM2.5, PM10, Nitrogen Dioxide ($\text{NO}_2$), and European Air Quality Index (EAQI with qualitative category and color indicator).
+  - **Meteorological**: Ambient Temperature (°C), Apparent "Feels-Like" Temperature (°C), Relative Humidity (%), Wind Speed (km/h), and WMO Weather Interpretation.
+- **Data Provenance & Transparency**:
+  - `is_modeled: true`: Accurately identifies values as regional numerical model forecasts (Copernicus CAMS & ECMWF NWP) rather than street-level sensor readings.
+  - `spatial_resolution_note`: Documents regional grid scale (~11 km).
+  - Preserves `null` for unrecorded variables without artificial zero-substitution.
+- **Route Association**: `POST /api/routes` automatically samples 3–5 representative waypoints along every candidate route and executes a single multi-coordinate batch query, attaching a `RouteEnvironmentalSummary` to each route.
+
+---
+
+### 4. `POST /api/rank`
+Ranks candidate walking routes based on user-selected environmental and distance criteria using an equal-priority normalized model and formal Pareto-dominance analysis.
+
+- **Formula**: $\text{Score}(R) = \frac{1}{|K|} \sum_{f \in K} \text{NormalizedScore}(R, f)$
+- **Outlier Bounds**: Factors are clipped to physical limits before relative min-max scaling to prevent outlier distortion.
+- **Pareto Dominance**: Non-dominated routes always rank ahead of dominated routes.
+- **Zero Weight Guessing**: Equal priority ($1/k$) is an algorithmic design choice, not an inferred personal psychological profile.
+- **Distance Baseline**: Default baseline evaluates all available factors with distance as documented tie-breaker.
+
+---
+
+### 5. `POST /api/routes/refresh`
+Refreshes environmental data (air quality, thermal comfort, traffic exposure, solar shade) for candidate routes without re-requesting ORS walking geometries.
+
+- **Selective Re-evaluation**: Updates route-level profiles, re-runs multi-criteria ranking, and tracks metric fluctuations.
+- **Change Explanation**: Explains which factors fluctuated and whether the recommended route changed.
+- **Resilient Stale Fallback**: If an upstream provider fails during refresh, previously cached readings are retained with an explicit `is_stale: true` and user warning rather than displaying blank route cards.
+- **Explicit Scope Limitation**: Pre-trip comparison re-evaluation only; does not perform live turn-by-turn navigation or real-time GPS rerouting.
+
+**Preference Factors Supported:**
+- `air_quality`: Lower EAQI / PM2.5 ($\downarrow$)
+- `temperature`: Lower apparent temperature / heat load ($\downarrow$)
+- `traffic_exposure`: Lower vehicular traffic index ($\downarrow$)
+- `greenery`: Higher tree canopy and park presence ($\uparrow$)
+- `walking_distance`: Shorter route distance ($\downarrow$)
+- `no_preference`: Applies the transparent default baseline
+
+**Mathematical Formulation:**
+$$\text{Score}(R) = \frac{1}{|F_{\text{eval}}|} \sum_{f \in F_{\text{eval}}} \text{normalized\_score}(R, f)$$
+
+- **Equal Priority Heuristic**: $w_f = 1/k$ is explicitly an algorithmic design choice to eliminate user cognitive burden, NOT a discovered psychological personal preference.
+- **Pareto Dominance**: Identifies routes strictly dominated by an alternative across evaluated criteria. Non-dominated routes always rank ahead of dominated alternatives.
+- **Deterministic Tie-Breaking**: Breaks ties using walking distance (shorter is better), followed by stable alphabetical route ID.
+- **Missing Data Handling**: Never zero-fills missing metrics. Unrecorded factors are excluded transparently, and recommendations are withheld if all selected criteria lack data.
+
+---
+
+### 5. `GET /api/health`
 Verifies backend status and configuration of external integrations (ORS key presence, Nominatim, Open-Meteo, Overpass).
 
 ---
@@ -255,6 +324,13 @@ The project includes an automated test suite executed via `pytest`:
    - Query length validation (minimum 3 characters)
    - Result mapping & empty query handling
    - Rate limit (429) and timeout (504) handling
+6. **Environmental Integration (Open-Meteo)** (27 tests total):
+   - Route geometry sampling (even spacing, start/end boundary retention)
+   - Response parsing for particulate matter (PM2.5, PM10), NO2, and European AQI
+   - Strict missing-field validation (asserting nulls are preserved and never silently zero-filled)
+   - WMO weather code descriptions and thermal parameter parsing
+   - Multi-waypoint route summary aggregation with documented metadata
+   - Open-Meteo failure and timeout resilience
 
 ---
 

@@ -10,14 +10,22 @@ import {
   Search,
   RotateCcw,
   Info,
-  Check,
   Layers,
   X,
   AlertCircle,
   Clock,
   Compass,
+  Award,
+  CheckCircle2,
+  AlertTriangle,
+  Scale,
+  SlidersHorizontal,
+  RefreshCw,
+  Calendar,
 } from 'lucide-react';
 import StatusBadge from './StatusBadge';
+import EnvironmentalPanel from './EnvironmentalPanel';
+import RouteComparisonTable from './RouteComparisonTable';
 import { searchLocations } from '../services/geocodingService';
 
 export default function Sidebar({
@@ -27,15 +35,23 @@ export default function Sidebar({
   setDestination,
   preferences,
   setPreferences,
+  departureTime = null,
+  setDepartureTime = () => {},
   clickMode,
   setClickMode,
   onCalculateRoutes,
+  onRefreshEnvironment = null,
+  isRefreshing = false,
+  lastRefreshTime = null,
+  reevaluationData = null,
   onClearRoutes,
   onReset,
   routes = [],
+  rankingData = null,
   selectedRouteId = null,
   onSelectRoute = () => {},
   isLoadingRoutes = false,
+  isRanking = false,
   routeError = null,
 }) {
   const [originSearchText, setOriginSearchText] = useState(origin?.label || '');
@@ -189,52 +205,107 @@ export default function Sidebar({
     setDestNoResults(false);
   };
 
+  const handleToggleNoPreference = () => {
+    setPreferences((prev) => {
+      const willBeNoPref = !prev.no_preference;
+      if (willBeNoPref) {
+        return {
+          air_quality: false,
+          temperature: false,
+          traffic_exposure: false,
+          greenery: false,
+          walking_distance: false,
+          no_preference: true,
+        };
+      } else {
+        return {
+          air_quality: true,
+          temperature: false,
+          traffic_exposure: false,
+          greenery: true,
+          walking_distance: true,
+          no_preference: false,
+        };
+      }
+    });
+  };
+
   const togglePreference = (key) => {
-    setPreferences((prev) => ({
-      ...prev,
-      [key]: !prev[key],
-    }));
+    setPreferences((prev) => {
+      const wasNoPref = !!prev.no_preference;
+      const currentVal = wasNoPref ? false : !!prev[key];
+      const newVal = !currentVal;
+
+      const updated = {
+        ...prev,
+        no_preference: false,
+        [key]: newVal,
+      };
+
+      // Check if all individual factors became false
+      const anyActive = ['air_quality', 'temperature', 'traffic_exposure', 'greenery', 'walking_distance'].some(
+        (f) => updated[f]
+      );
+      if (!anyActive) {
+        updated.no_preference = true;
+      }
+
+      return updated;
+    });
   };
 
   const preferenceItems = [
     {
       id: 'air_quality',
-      label: 'Air Quality (Low PM2.5 / AQI)',
+      label: 'Air Quality',
+      subtitle: 'Lower EAQI & PM2.5 particulates',
       icon: Wind,
       color: '#3b82f6',
-      source: 'Open-Meteo AQI',
+      source: 'Copernicus CAMS (~11 km grid)',
+      direction: 'Lower is better',
+    },
+    {
+      id: 'temperature',
+      label: 'Temperature / Heat',
+      subtitle: 'Lower apparent heat stress',
+      icon: Thermometer,
+      color: '#f59e0b',
+      source: 'ECMWF / ICON NWP',
+      direction: 'Lower is better',
+    },
+    {
+      id: 'traffic_exposure',
+      label: 'Traffic Exposure',
+      subtitle: 'Lower motor vehicle corridor proximity',
+      icon: ShieldCheck,
+      color: '#ec4899',
+      source: 'OSM Infrastructure Hierarchy',
+      direction: 'Lower is better',
     },
     {
       id: 'greenery',
       label: 'Greenery & Parks',
+      subtitle: 'Higher park presence & tree canopies',
       icon: TreePine,
       color: '#10b981',
-      source: 'OSM Overpass',
-    },
-    {
-      id: 'temperature',
-      label: 'Mild Temperature / Shade',
-      icon: Thermometer,
-      color: '#f59e0b',
-      source: 'Open-Meteo Weather',
+      source: 'OSM Overpass green buffers',
+      direction: 'Higher is better',
     },
     {
       id: 'walking_distance',
-      label: 'Shortest Walking Distance',
+      label: 'Walking Distance',
+      subtitle: 'Shortest direct pedestrian path',
       icon: Footprints,
       color: '#8b5cf6',
-      source: 'OpenRouteService',
-    },
-    {
-      id: 'traffic_safety',
-      label: 'Pedestrian-Friendly / Low Traffic',
-      icon: ShieldCheck,
-      color: '#ec4899',
-      source: 'OSM Walkways',
+      source: 'OpenRouteService foot-walking',
+      direction: 'Lower is better',
     },
   ];
 
-  const activePreferencesCount = Object.values(preferences).filter(Boolean).length;
+  const activeFactorsList = ['air_quality', 'temperature', 'traffic_exposure', 'greenery', 'walking_distance'].filter(
+    (k) => !preferences.no_preference && preferences[k]
+  );
+  const activePreferencesCount = activeFactorsList.length;
 
   return (
     <aside className="sidebar-container">
@@ -412,7 +483,92 @@ export default function Sidebar({
           </div>
         </section>
 
-        {/* Action Controls for Route Calculation */}
+        {/* Departure Time & Temporal Forecast Section */}
+        <section className="control-section departure-time-section">
+          <div className="section-header">
+            <div className="section-title-wrap">
+              <Clock size={16} className="text-primary" />
+              <h3 className="section-title">Departure Time & Forecast</h3>
+            </div>
+            <span className={`time-badge-pill ${departureTime ? 'forecast' : 'now'}`}>
+              {departureTime ? 'Forecast Model' : 'Current Conditions (Now)'}
+            </span>
+          </div>
+
+          <div className="time-quick-presets">
+            <button
+              type="button"
+              className={`time-preset-btn ${!departureTime ? 'active' : ''}`}
+              onClick={() => setDepartureTime(null)}
+            >
+              Now
+            </button>
+            <button
+              type="button"
+              className="time-preset-btn"
+              onClick={() => {
+                const d = new Date(Date.now() + 3600 * 1000);
+                d.setMinutes(0, 0, 0);
+                setDepartureTime(d.toISOString());
+              }}
+            >
+              +1 Hr
+            </button>
+            <button
+              type="button"
+              className="time-preset-btn"
+              onClick={() => {
+                const d = new Date(Date.now() + 3 * 3600 * 1000);
+                d.setMinutes(0, 0, 0);
+                setDepartureTime(d.toISOString());
+              }}
+            >
+              +3 Hrs
+            </button>
+            <button
+              type="button"
+              className="time-preset-btn"
+              onClick={() => {
+                const d = new Date(Date.now() + 6 * 3600 * 1000);
+                d.setMinutes(0, 0, 0);
+                setDepartureTime(d.toISOString());
+              }}
+            >
+              +6 Hrs
+            </button>
+          </div>
+
+          <div className="custom-time-picker-wrap">
+            <label className="input-label-sm">
+              <Calendar size={13} className="inline-icon" /> Specific Departure:
+            </label>
+            <input
+              type="datetime-local"
+              className="datetime-input"
+              value={departureTime ? departureTime.slice(0, 16) : ''}
+              onChange={(e) => {
+                if (e.target.value) {
+                  const iso = new Date(e.target.value).toISOString();
+                  setDepartureTime(iso);
+                } else {
+                  setDepartureTime(null);
+                }
+              }}
+            />
+          </div>
+
+          {departureTime && (
+            <div className="time-info-note">
+              <Info size={13} />
+              <span>
+                Queries Open-Meteo gridded forecast model for the selected hour.
+                Live traffic speed flow is unavailable for future hours.
+              </span>
+            </div>
+          )}
+        </section>
+
+        {/* Action Controls for Route Calculation & Environmental Refresh */}
         <section className="actions-section">
           <button
             type="button"
@@ -432,6 +588,28 @@ export default function Sidebar({
               </>
             )}
           </button>
+
+          {routes.length > 0 && onRefreshEnvironment && (
+            <button
+              type="button"
+              className="btn-refresh-env"
+              onClick={onRefreshEnvironment}
+              disabled={isRefreshing || isLoadingRoutes}
+              title="Refresh environmental metrics and recalculate rankings without re-querying route geometry"
+            >
+              {isRefreshing ? (
+                <>
+                  <div className="button-loader"></div>
+                  <span>Refreshing Environmental Data...</span>
+                </>
+              ) : (
+                <>
+                  <RefreshCw size={16} />
+                  <span>Refresh Environmental Data</span>
+                </>
+              )}
+            </button>
+          )}
 
           {(routes.length > 0 || routeError) && (
             <button
@@ -471,9 +649,59 @@ export default function Sidebar({
                 <h2 className="section-title">Walking Routes ({routes.length})</h2>
               </div>
               <span className="badge-count">
-                {routes.length > 1 ? `${routes.length} Available` : '1 Route'}
+                {isRanking ? 'Recalculating...' : `${routes.length} Evaluated`}
               </span>
             </div>
+
+            {/* Freshness Timestamp Callout */}
+            {lastRefreshTime && (
+              <div className="freshness-callout-bar">
+                <Clock size={13} className="text-muted inline-icon" />
+                <span>Last Refreshed: {lastRefreshTime}</span>
+              </div>
+            )}
+
+            {/* Stale Cache Notice Banner */}
+            {routes.some((r) => r.environment?.is_stale || r.timestamps?.is_stale) && (
+              <div className="sidebar-stale-alert">
+                <AlertTriangle size={15} className="text-warning inline-icon" />
+                <span>
+                  <strong>Stale Data Notice:</strong> Upstream provider request failed during refresh; displaying retained previous measurements.
+                </span>
+              </div>
+            )}
+
+            {/* Environmental Re-evaluation Diff Card */}
+            {reevaluationData && (
+              <div className="reevaluation-card">
+                <div className="reevaluation-header">
+                  <RefreshCw size={15} className="text-primary" />
+                  <h4>Environmental Re-evaluation Result</h4>
+                </div>
+                <div className={`reevaluation-badge ${reevaluationData.recommendation_changed ? 'changed' : 'steady'}`}>
+                  {reevaluationData.recommendation_change_note}
+                </div>
+                {reevaluationData.metric_changes && reevaluationData.metric_changes.length > 0 ? (
+                  <div className="reevaluation-changes-box">
+                    <span className="changes-title">Detected Metric Fluctuations:</span>
+                    <ul className="changes-list">
+                      {reevaluationData.metric_changes.map((ch, chIdx) => (
+                        <li key={chIdx}>
+                          <span className="change-route-name">{ch.route_name}:</span> {ch.change_summary}
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                ) : (
+                  <p className="reevaluation-steady-text">
+                    No significant metric fluctuations detected across route corridor.
+                  </p>
+                )}
+                <div className="reevaluation-disclaimer">
+                  ℹ️ {reevaluationData.disclaimer}
+                </div>
+              </div>
+            )}
 
             {routes.length === 1 && (
               <div className="honest-notice-banner">
@@ -484,13 +712,32 @@ export default function Sidebar({
               </div>
             )}
 
+            {/* Warnings regarding unavailable factors or withheld recommendations */}
+            {rankingData?.warnings && rankingData.warnings.length > 0 && (
+              <div className="ranking-warnings-card">
+                <div className="warning-card-header">
+                  <AlertTriangle size={16} className="text-warning" />
+                  <span>Data Completeness Notice</span>
+                </div>
+                <ul className="warning-list">
+                  {rankingData.warnings.map((w, idx) => (
+                    <li key={idx}>{w}</li>
+                  ))}
+                </ul>
+              </div>
+            )}
+
             <div className="routes-list">
-              {routes.map((route) => {
+              {routes.map((route, idx) => {
                 const isSelected = route.id === selectedRouteId;
+                const isRec = !!route.is_recommended;
+                const isDom = !!route.is_pareto_dominated;
+                const rankNum = route.rank || idx + 1;
+
                 return (
                   <div
                     key={route.id}
-                    className={`route-card ${isSelected ? 'selected' : ''}`}
+                    className={`route-card ${isSelected ? 'selected' : ''} ${isRec ? 'card-recommended' : ''} ${isDom ? 'card-dominated' : ''}`}
                     onClick={() => onSelectRoute(route.id)}
                     style={{ borderLeftColor: route.color }}
                   >
@@ -502,10 +749,32 @@ export default function Sidebar({
                         />
                         <h3 className="route-name">{route.name}</h3>
                       </div>
-                      <span className={`route-type-badge ${route.is_primary ? 'primary' : 'alt'}`}>
-                        {route.is_primary ? 'Recommended' : 'Alternative'}
-                      </span>
+                      <div className="route-badges-wrap">
+                        <span className="route-rank-pill">Rank #{rankNum}</span>
+                        {isRec ? (
+                          <span className="route-type-badge recommended">
+                            <Award size={12} /> Recommended
+                          </span>
+                        ) : isDom ? (
+                          <span className="route-type-badge dominated">
+                            <AlertTriangle size={12} /> Dominated
+                          </span>
+                        ) : (
+                          <span className="route-type-badge pareto">
+                            <CheckCircle2 size={12} /> Pareto-Optimal
+                          </span>
+                        )}
+                      </div>
                     </div>
+
+                    {/* Overall Score */}
+                    {typeof route.multi_criteria_score === 'number' && (
+                      <div className="route-score-bar">
+                        <span className="score-label">Multi-Criteria Score:</span>
+                        <strong className="score-val">{route.multi_criteria_score.toFixed(2)}</strong>
+                        <small className="score-max">/ 1.00</small>
+                      </div>
+                    )}
 
                     <div className="route-card-metrics">
                       <div className="metric-chip">
@@ -518,11 +787,62 @@ export default function Sidebar({
                         <span className="metric-val">{Math.round(route.duration_min)} min</span>
                         <small className="metric-sub">walk</small>
                       </div>
+
+                      {/* Preference-specific quick metric chips */}
+                      {(!preferences?.no_preference && preferences?.air_quality) && route.environment?.air_quality?.european_aqi?.value !== null && route.environment?.air_quality?.european_aqi?.value !== undefined && (
+                        <div className="metric-chip" title="European Air Quality Index">
+                          <Wind size={14} className="metric-icon text-primary" />
+                          <span className="metric-val">{route.environment.air_quality.european_aqi.value} EAQI</span>
+                          <small className="metric-sub">air</small>
+                        </div>
+                      )}
+
+                      {(!preferences?.no_preference && preferences?.temperature) && route.environment?.weather?.temperature_c !== null && route.environment?.weather?.temperature_c !== undefined && (
+                        <div className="metric-chip" title="Ambient Temperature">
+                          <Thermometer size={14} className="metric-icon text-warning" />
+                          <span className="metric-val">{route.environment.weather.temperature_c}°C</span>
+                          <small className="metric-sub">temp</small>
+                        </div>
+                      )}
+
+                      {(!preferences?.no_preference && preferences?.greenery) && route.environment?.greenery?.score !== null && route.environment?.greenery?.score !== undefined && (
+                        <div className="metric-chip" title="Greenery Buffer Score">
+                          <TreePine size={14} className="metric-icon text-success" />
+                          <span className="metric-val">{Math.round(route.environment.greenery.score)}%</span>
+                          <small className="metric-sub">green</small>
+                        </div>
+                      )}
+
+                      {(!preferences?.no_preference && preferences?.traffic_exposure) && route.environment?.traffic_exposure?.score !== null && route.environment?.traffic_exposure?.score !== undefined && (
+                        <div className="metric-chip" title="Traffic Exposure Index">
+                          <ShieldCheck size={14} className="metric-icon text-secondary" />
+                          <span className="metric-val">{Math.round(route.environment.traffic_exposure.score)}/100</span>
+                          <small className="metric-sub">traffic</small>
+                        </div>
+                      )}
                     </div>
 
-                    {route.summary && (
-                      <p className="route-summary-text">{route.summary}</p>
+                    {/* Trade-off summary banner */}
+                    {route.trade_offs && (
+                      <div className="route-tradeoff-box">
+                        <strong>Trade-Off:</strong> <span>{route.trade_offs}</span>
+                      </div>
                     )}
+
+                    {/* Reasons list */}
+                    {route.reasons && route.reasons.length > 0 && (
+                      <div className="route-reasons-box">
+                        <span className="reasons-title">Ranking Breakdown:</span>
+                        <ul className="reasons-list">
+                          {route.reasons.map((rText, rIdx) => (
+                            <li key={rIdx}>{rText}</li>
+                          ))}
+                        </ul>
+                      </div>
+                    )}
+
+                    {/* Real Environmental Data Panel filtered by user preferences */}
+                    <EnvironmentalPanel environment={route.environment} preferences={preferences} />
 
                     <div className="route-card-footer">
                       <label className="route-select-radio">
@@ -539,6 +859,15 @@ export default function Sidebar({
                 );
               })}
             </div>
+
+            {/* Comparison Table Across All Routes filtered by user preferences */}
+            <RouteComparisonTable
+              routes={routes}
+              rankingData={rankingData}
+              selectedRouteId={selectedRouteId}
+              onSelectRoute={onSelectRoute}
+              preferences={preferences}
+            />
           </section>
         )}
 
@@ -546,29 +875,59 @@ export default function Sidebar({
         <section className="control-section">
           <div className="section-header">
             <div className="section-title-wrap">
-              <span className="step-num">2</span>
+              <SlidersHorizontal size={18} className="text-primary" />
               <h2 className="section-title">Environmental Preferences</h2>
             </div>
             <span className="badge-count">
-              {activePreferencesCount > 0
+              {preferences.no_preference
+                ? 'Default Baseline'
+                : activePreferencesCount > 0
                 ? `${activePreferencesCount} Active`
-                : 'Default Rule'}
+                : 'Default Baseline'}
             </span>
           </div>
 
           <p className="section-description">
-            Select the environmental factors you care about. No manual numeric weights required—our multi-criteria algorithm evaluates alternative routes transparently.
+            Select the environmental factors you care about. No manual numeric weights required—our multi-criteria algorithm evaluates alternative routes transparently using equal priority.
           </p>
 
+          {/* Explicit No-Preference Option */}
+          <label
+            className={`preference-card no-pref-card ${preferences.no_preference ? 'active' : ''}`}
+            htmlFor="pref-no-preference"
+          >
+            <div className="preference-icon-badge no-pref-badge">
+              <Scale size={18} />
+            </div>
+            <div className="preference-details">
+              <span className="preference-name">No Preference (Transparent Baseline)</span>
+              <span className="preference-source">
+                Evaluates all available environmental factors & distance equally without bias
+              </span>
+            </div>
+            <input
+              type="checkbox"
+              id="pref-no-preference"
+              name="no_preference"
+              checked={!!preferences.no_preference}
+              onChange={handleToggleNoPreference}
+              className="accessible-checkbox"
+              aria-label="No preference: apply transparent default baseline"
+            />
+          </label>
+
+          {/* 5 Specific Environmental Factors */}
           <div className="preferences-grid">
             {preferenceItems.map((pref) => {
               const Icon = pref.icon;
-              const isChecked = !!preferences[pref.id];
+              const isChecked = !preferences.no_preference && !!preferences[pref.id];
+              const isDisabled = !!preferences.no_preference;
+
               return (
-                <div
+                <label
                   key={pref.id}
-                  className={`preference-card ${isChecked ? 'active' : ''}`}
-                  onClick={() => togglePreference(pref.id)}
+                  className={`preference-card ${isChecked ? 'active' : ''} ${isDisabled ? 'disabled' : ''}`}
+                  htmlFor={`pref-${pref.id}`}
                 >
                   <div
                     className="preference-icon-badge"
@@ -578,28 +937,35 @@ export default function Sidebar({
                   </div>
                   <div className="preference-details">
                     <span className="preference-name">{pref.label}</span>
-                    <span className="preference-source">Data: {pref.source}</span>
+                    <span className="preference-source">{pref.subtitle}</span>
+                    <span className="preference-direction-tag">{pref.direction}</span>
                   </div>
-                  <div className={`checkbox-custom ${isChecked ? 'checked' : ''}`}>
-                    {isChecked && <Check size={14} />}
-                  </div>
-                </div>
+                  <input
+                    type="checkbox"
+                    id={`pref-${pref.id}`}
+                    name={pref.id}
+                    checked={isChecked}
+                    onChange={() => togglePreference(pref.id)}
+                    className="accessible-checkbox"
+                    aria-label={`Toggle preference for ${pref.label}`}
+                  />
+                </label>
               );
             })}
           </div>
 
-          {/* Default Rule Callout */}
+          {/* Default Rule Callout & Algorithmic Notice */}
           <div className="default-rule-callout">
             <Info size={16} className="callout-icon" />
             <div className="callout-body">
-              <strong>Transparent Default Rule:</strong>
-              {activePreferencesCount === 0 ? (
+              <strong>Transparent Algorithmic Policy:</strong>
+              {preferences.no_preference ? (
                 <p>
-                  No preference active. The system applies the <em>Standard Baseline</em>: minimizing walking distance while maintaining pedestrian pathway safety.
+                  <strong>Default Baseline Active:</strong> Candidate routes are evaluated across all available environmental indicators and walking distance with equal priority. Does not claim to find an absolute healthiest path.
                 </p>
               ) : (
                 <p>
-                  The algorithm balances {activePreferencesCount} selected criteria across candidate routes.
+                  The engine scores non-dominated candidate routes with equal priority (1/{activePreferencesCount || 1}) across your {activePreferencesCount} selected criteria. Equal weighting is an algorithmic design choice, not a discovered personal psychological preference.
                 </p>
               )}
             </div>
@@ -639,13 +1005,13 @@ export default function Sidebar({
               <span className="bullet">✓</span>
               <span>OpenRouteService Walking Directions & Alternatives</span>
             </li>
-            <li className="roadmap-item upcoming">
-              <span className="bullet">○</span>
-              <span>Open-Meteo & Overpass Environmental Encoders</span>
+            <li className="roadmap-item done">
+              <span className="bullet">✓</span>
+              <span>Open-Meteo Multi-Pollutant & Weather Encoders</span>
             </li>
-            <li className="roadmap-item upcoming">
-              <span className="bullet">○</span>
-              <span>Multi-Criteria Preference Ranking Algorithm</span>
+            <li className="roadmap-item done">
+              <span className="bullet">✓</span>
+              <span>Multi-Criteria Preference Engine & Pareto Dominance</span>
             </li>
           </ul>
         </section>
