@@ -45,6 +45,18 @@ class RouteRequest(BaseModel):
         return self
 
 
+class RouteStepModel(BaseModel):
+    """Model representing an individual turn-by-turn walking instruction/maneuver."""
+    instruction: str = Field(..., description="Human-readable turn-by-turn instruction text")
+    distance_m: float = Field(default=0.0, description="Step distance in metres")
+    duration_s: float = Field(default=0.0, description="Step duration in seconds")
+    type: Optional[int] = Field(default=None, description="Maneuver action code (e.g. ORS step type)")
+    modifier: Optional[str] = Field(default=None, description="Maneuver modifier (e.g. 'left', 'right', 'straight')")
+    name: Optional[str] = Field(default=None, description="Street or pathway name")
+    location: Optional[List[float]] = Field(default=None, description="Starting coordinate [latitude, longitude]")
+    way_points: Optional[List[int]] = Field(default=None, description="Start and end coordinate index interval [start_idx, end_idx]")
+
+
 class RouteModel(BaseModel):
     """Model representing an individual calculated walking route.
 
@@ -71,6 +83,10 @@ class RouteModel(BaseModel):
     color: str = Field(default="#2563eb", description="Suggested distinct hex color code for map display")
     is_primary: bool = Field(default=False, description="Whether this is the primary recommended route")
     summary: Optional[str] = Field(default=None, description="Brief summary description of the route")
+    steps: List[RouteStepModel] = Field(
+        default_factory=list,
+        description="Ordered turn-by-turn walking maneuver instructions"
+    )
     environment: Optional["RouteEnvironmentalSummary"] = Field(
         default=None,
         description="Environmental profile (air quality and temperature) associated with this route"

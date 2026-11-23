@@ -6,7 +6,7 @@ from typing import List, Optional
 from fastapi import APIRouter, Query
 from app.core.config import settings
 from app.schemas.environment import SinglePointEnvironmentResponse
-from app.schemas.geocoding import GeocodeResult
+from app.schemas.geocoding import GeocodeResult, ReverseGeocodeResult
 from app.schemas.preferences import (
     RouteRankingRequest,
     RouteRankingResponse,
@@ -16,7 +16,7 @@ from app.schemas.preferences import (
 from app.schemas.routes import RouteRequest, RouteResponse
 from app.algorithm.ranking_engine import rank_routes
 from app.services.environmental_service import get_point_environmental_data
-from app.services.geocoding_service import search_locations
+from app.services.geocoding_service import search_locations, reverse_geocode
 from app.services.routing_service import get_walking_routes, refresh_route_environments
 
 router = APIRouter()
@@ -132,6 +132,23 @@ async def geocode_endpoint(
 ):
     """Geocode search query into matching location candidates."""
     return await search_locations(query=q, limit=limit)
+
+
+@router.get(
+    "/geocode/reverse",
+    response_model=ReverseGeocodeResult,
+    summary="Reverse Geocode Coordinates to Address",
+    description=(
+        "Resolves latitude and longitude coordinates into a human-readable location address "
+        "using OpenStreetMap Nominatim with rate limiting, caching, and custom User-Agent."
+    ),
+)
+async def reverse_geocode_endpoint(
+    lat: float = Query(..., ge=-90.0, le=90.0, description="Latitude in decimal degrees (-90 to 90)"),
+    lon: float = Query(..., ge=-180.0, le=180.0, description="Longitude in decimal degrees (-180 to 180)"),
+):
+    """Reverse geocode coordinates into a human-readable location address."""
+    return await reverse_geocode(lat=lat, lon=lon)
 
 
 @router.get(

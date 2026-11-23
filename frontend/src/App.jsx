@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback, useRef } from 'react';
 import Sidebar from './components/Sidebar';
 import MapView from './components/MapView';
 import { fetchWalkingRoutes, rankCandidateRoutes, refreshRouteEnvironments } from './services/routingService';
+import { reverseGeocode } from './services/geocodingService';
 import './App.css';
 
 export default function App() {
@@ -95,25 +96,117 @@ export default function App() {
     }
   }, [preferences, rawRoutes, executeRanking]);
 
+  // Client cache for resolved reverse-geocoded coordinates (key: "lat,lon" -> displayName)
+  const reverseGeocodeCacheRef = useRef(new Map());
+
+  // Active reverse geocoding request trackers per target to support debouncing & cancellation
+  const activeReverseGeocodeRef = useRef({
+    origin: { abortController: null, timer: null, seq: 0 },
+    destination: { abortController: null, timer: null, seq: 0 },
+  });
+
+  // Cleanup pending reverse-geocoding timers and abort in-flight requests on unmount
+  useEffect(() => {
+    const activeTrackers = activeReverseGeocodeRef.current;
+    return () => {
+      Object.values(activeTrackers).forEach((tracker) => {
+        if (tracker.timer) clearTimeout(tracker.timer);
+        if (tracker.abortController) tracker.abortController.abort();
+      });
+    };
+  }, []);
+
   // Handle click on Leaflet map canvas
   const handleMapClick = (lat, lon) => {
     const formattedCoord = `${lat.toFixed(5)}, ${lon.toFixed(5)}`;
+    let target = 'origin';
+
     if (clickMode === 'origin') {
-      setOrigin({ lat, lon, label: `Selected Start: ${formattedCoord}` });
+      target = 'origin';
       setClickMode('none');
     } else if (clickMode === 'destination') {
-      setDestination({ lat, lon, label: `Selected Destination: ${formattedCoord}` });
+      target = 'destination';
       setClickMode('none');
     } else {
-      if (!origin) {
-        setOrigin({ lat, lon, label: `Point A: ${formattedCoord}` });
-      } else {
-        setDestination({ lat, lon, label: `Point B: ${formattedCoord}` });
-      }
+      target = !origin ? 'origin' : 'destination';
     }
+
+    // 1 & 2: Immediately preserve coordinates for routing with readable coordinate fallback
+    const fallbackLabel =
+      target === 'origin'
+        ? (clickMode === 'origin' ? `Selected Start: ${formattedCoord}` : `Point A: ${formattedCoord}`)
+        : (clickMode === 'destination' ? `Selected Destination: ${formattedCoord}` : `Point B: ${formattedCoord}`);
+
+    if (target === 'origin') {
+      setOrigin({ lat, lon, label: fallbackLabel });
+    } else {
+      setDestination({ lat, lon, label: fallbackLabel });
+    }
+
+    // 3 & 4: Manage reverse geocoding with debouncing (500ms), cancellation, and client cache
+    const tracker = activeReverseGeocodeRef.current[target];
+    const seq = ++tracker.seq;
+
+    if (tracker.timer) {
+      clearTimeout(tracker.timer);
+      tracker.timer = null;
+    }
+    if (tracker.abortController) {
+      tracker.abortController.abort();
+      tracker.abortController = null;
+    }
+
+    const cacheKey = `${lat.toFixed(5)},${lon.toFixed(5)}`;
+    if (reverseGeocodeCacheRef.current.has(cacheKey)) {
+      const cachedName = reverseGeocodeCacheRef.current.get(cacheKey);
+      if (target === 'origin') {
+        setOrigin((prev) => (prev && prev.lat === lat && prev.lon === lon ? { ...prev, label: cachedName } : prev));
+      } else {
+        setDestination((prev) => (prev && prev.lat === lat && prev.lon === lon ? { ...prev, label: cachedName } : prev));
+      }
+      return;
+    }
+
+    const abortController = new AbortController();
+    tracker.abortController = abortController;
+
+    tracker.timer = setTimeout(async () => {
+      try {
+        const result = await reverseGeocode(lat, lon, abortController.signal);
+        // Only update if this request is still authoritative and coordinates haven't changed
+        if (result?.displayName && tracker.seq === seq) {
+          reverseGeocodeCacheRef.current.set(cacheKey, result.displayName);
+          if (target === 'origin') {
+            setOrigin((prev) =>
+              prev && prev.lat === lat && prev.lon === lon ? { ...prev, label: result.displayName } : prev
+            );
+          } else {
+            setDestination((prev) =>
+              prev && prev.lat === lat && prev.lon === lon ? { ...prev, label: result.displayName } : prev
+            );
+          }
+        }
+      } catch (err) {
+        if (err.name !== 'AbortError') {
+          // If reverse geocoding fails, retain the coordinate-based fallback
+          console.warn(`Reverse geocoding failed for ${target}, retaining coordinates:`, err);
+        }
+      }
+    }, 500);
   };
 
   const handleReset = () => {
+    Object.values(activeReverseGeocodeRef.current).forEach((tracker) => {
+      if (tracker.timer) {
+        clearTimeout(tracker.timer);
+        tracker.timer = null;
+      }
+      if (tracker.abortController) {
+        tracker.abortController.abort();
+        tracker.abortController = null;
+      }
+      tracker.seq++;
+    });
     setOrigin(null);
     setDestination(null);
     setRawRoutes([]);

@@ -37,6 +37,8 @@ logger = logging.getLogger(__name__)
 
 # In-memory cache for major road queries: bbox_key -> (timestamp, elements)
 _road_cache: Dict[str, Tuple[float, List[Dict[str, Any]]]] = {}
+# In-memory cache for TomTom point queries: normalized "lat,lon" -> (timestamp, Optional[Dict[str, float]])
+_tomtom_traffic_cache: Dict[str, Tuple[float, Optional[Dict[str, float]]]] = {}
 _traffic_lock = asyncio.Lock()
 _last_traffic_request_time = 0.0
 
@@ -109,11 +111,99 @@ async def fetch_overpass_major_roads(
             return None
 
 
+def extract_representative_traffic_points(
+    coordinates: List[List[float]], max_points: int = 2
+) -> List[Tuple[float, float]]:
+    """Extract 1 to 2 representative coordinates from an individual route geometry.
+    - Routes with few waypoints (< 4) use the midpoint.
+    - Longer routes use spaced points (e.g. 1/3 and 2/3).
+    - If spaced points are closer than 100m, single midpoint is preferred to avoid redundant API calls.
+    """
+    if not coordinates:
+        return []
+    n = len(coordinates)
+    if n < 4 or max_points <= 1:
+        pt = coordinates[n // 2]
+        return [(float(pt[0]), float(pt[1]))]
+
+    p1 = coordinates[n // 3]
+    p2 = coordinates[(2 * n) // 3]
+    lat1, lon1 = float(p1[0]), float(p1[1])
+    lat2, lon2 = float(p2[0]), float(p2[1])
+
+    # If the two points are too close (< 100m apart), sample only the midpoint
+    if haversine_distance_m(lat1, lon1, lat2, lon2) < 100.0:
+        mid = coordinates[n // 2]
+        return [(float(mid[0]), float(mid[1]))]
+
+    return [(lat1, lon1), (lat2, lon2)]
+
+
+async def query_tomtom_traffic_point(
+    lat: float, lon: float, client: Optional[httpx.AsyncClient] = None
+) -> Optional[Dict[str, float]]:
+    """Query TomTom Traffic Flow for a single coordinate point with caching."""
+    key = settings.TOMTOM_TRAFFIC_API_KEY.strip() if settings.TOMTOM_TRAFFIC_API_KEY else ""
+    if not key or key == "your_tomtom_api_key_here":
+        return None
+
+    cache_key = f"{round(lat, 4):.4f},{round(lon, 4):.4f}"
+    now = time.time()
+    if cache_key in _tomtom_traffic_cache:
+        cached_time, cached_val = _tomtom_traffic_cache[cache_key]
+        if now - cached_time < settings.TRAFFIC_CACHE_TTL_SECONDS:
+            return cached_val
+
+    url = f"{settings.TOMTOM_TRAFFIC_API_URL}?point={lat},{lon}&unit=KMPH&key={key}"
+
+    async def _request(c: httpx.AsyncClient) -> Optional[Dict[str, float]]:
+        resp = await c.get(url)
+        if resp.status_code == 200:
+            data = resp.json()
+            flow = data.get("flowSegmentData", {})
+            current_speed = flow.get("currentSpeed")
+            free_flow = flow.get("freeFlowSpeed")
+
+            if current_speed is not None and free_flow is not None and free_flow > 0:
+                ratio = float(current_speed) / float(free_flow)
+                congestion_pct = round(max(0.0, min(100.0, (1.0 - ratio) * 100.0)), 1)
+                parsed = {
+                    "current_speed": float(current_speed),
+                    "free_flow": float(free_flow),
+                    "congestion_pct": congestion_pct,
+                }
+                _tomtom_traffic_cache[cache_key] = (now, parsed)
+                return parsed
+            else:
+                _tomtom_traffic_cache[cache_key] = (now, None)
+                return None
+        elif resp.status_code in (401, 403):
+            logger.warning("TomTom Traffic authorization failed.")
+            return None
+        elif resp.status_code == 429:
+            logger.warning("TomTom Traffic rate limit reached.")
+            return None
+        else:
+            logger.warning(f"TomTom Traffic returned status {resp.status_code}")
+            return None
+
+    try:
+        if client is not None:
+            return await _request(client)
+        else:
+            async with httpx.AsyncClient(timeout=settings.TRAFFIC_TIMEOUT_SECONDS) as c:
+                return await _request(c)
+    except Exception as exc:
+        logger.warning(f"Live traffic query error for point ({lat}, {lon}) (non-fatal): {exc}")
+        return None
+
+
 async def fetch_live_traffic_flow(
-    sampled_coords: List[List[float]]
+    sampled_coords: List[List[float]],
+    client: Optional[httpx.AsyncClient] = None,
 ) -> Optional[LiveTrafficMetrics]:
-    """Query live traffic speed and congestion from TomTom Traffic Flow API if API key is configured.
-    Returns None if no API key is provided or if service is unreachable.
+    """Query live traffic speed and congestion from TomTom Traffic Flow API for an individual candidate route.
+    Returns None if no API key is provided, service is unreachable, or no usable flow data returned.
     """
     key = settings.TOMTOM_TRAFFIC_API_KEY.strip() if settings.TOMTOM_TRAFFIC_API_KEY else ""
     if not key or key == "your_tomtom_api_key_here":
@@ -123,45 +213,34 @@ async def fetch_live_traffic_flow(
     if not sampled_coords:
         return None
 
-    # Query midpoint of route
-    midpoint = sampled_coords[len(sampled_coords) // 2]
-    lat, lon = midpoint[0], midpoint[1]
+    points = extract_representative_traffic_points(sampled_coords, max_points=2)
+    if not points:
+        return None
 
-    url = f"{settings.TOMTOM_TRAFFIC_API_URL}?point={lat},{lon}&unit=KMPH&key={key}"
+    tasks = [query_tomtom_traffic_point(lat, lon, client=client) for lat, lon in points]
+    point_results = await asyncio.gather(*tasks, return_exceptions=True)
 
-    try:
-        async with httpx.AsyncClient(timeout=settings.TRAFFIC_TIMEOUT_SECONDS) as client:
-            resp = await client.get(url)
-            if resp.status_code == 200:
-                data = resp.json()
-                flow = data.get("flowSegmentData", {})
-                current_speed = flow.get("currentSpeed")
-                free_flow = flow.get("freeFlowSpeed")
+    valid_results = [
+        r for r in point_results
+        if isinstance(r, dict) and r.get("current_speed") is not None
+    ]
 
-                if current_speed is not None and free_flow is not None and free_flow > 0:
-                    # Congestion index = (1 - current/freeFlow) * 100
-                    ratio = float(current_speed) / float(free_flow)
-                    congestion_pct = round(max(0.0, min(100.0, (1.0 - ratio) * 100.0)), 1)
-                    now_iso = datetime.now(timezone.utc).isoformat()
+    if not valid_results:
+        return None
 
-                    return LiveTrafficMetrics(
-                        congestion_pct=congestion_pct,
-                        current_speed_kmh=float(current_speed),
-                        free_flow_speed_kmh=float(free_flow),
-                        provider="TomTom Traffic Flow API",
-                        timestamp=now_iso,
-                        status="available",
-                    )
-            elif resp.status_code in (401, 403):
-                logger.warning("TomTom Traffic authorization failed.")
-                return None
-            elif resp.status_code == 429:
-                logger.warning("TomTom Traffic rate limit reached.")
-                return None
-    except Exception as exc:
-        logger.warning(f"Live traffic query error (non-fatal): {exc}")
+    avg_congestion = round(sum(r["congestion_pct"] for r in valid_results) / len(valid_results), 1)
+    avg_current_speed = round(sum(r["current_speed"] for r in valid_results) / len(valid_results), 1)
+    avg_free_flow = round(sum(r["free_flow"] for r in valid_results) / len(valid_results), 1)
+    now_iso = datetime.now(timezone.utc).isoformat()
 
-    return None
+    return LiveTrafficMetrics(
+        congestion_pct=avg_congestion,
+        current_speed_kmh=avg_current_speed,
+        free_flow_speed_kmh=avg_free_flow,
+        provider="TomTom Traffic Flow API",
+        timestamp=now_iso,
+        status="available",
+    )
 
 
 def is_time_non_current(departure_time: Optional[str]) -> Tuple[bool, Optional[str]]:
@@ -346,26 +425,51 @@ async def enrich_routes_with_traffic_data(
     routes: List[RouteModel], departure_time: Optional[str] = None
 ) -> None:
     """Enrich candidate walking routes with traffic exposure indicators:
-    - Queries TomTom live traffic if key configured and departure is near-current.
-    - Otherwise queries Overpass for major road infrastructure to compute static proxy.
+    - Queries TomTom live traffic independently for each candidate route if key configured and departure is near-current.
+    - Falls back to route-specific static road hierarchy proxy from OSM if live traffic is unavailable or unconfigured.
+    - Ensures candidate routes never inherit Route 0's traffic metrics.
     """
     if not routes:
         return
 
-    # Check for live traffic API integration first (only if key configured)
-    live_traffic_metrics: Optional[LiveTrafficMetrics] = None
-    if settings.TOMTOM_TRAFFIC_API_KEY:
-        live_traffic_metrics = await fetch_live_traffic_flow(routes[0].coordinates)
-
-    # Query major roads in route corridor bounding box
+    # 1. Query major roads in route corridor bounding box once for all routes (static fallback)
     bbox = compute_corridor_bbox(routes)
     osm_roads = await fetch_overpass_major_roads(bbox)
 
-    for route in routes:
+    # 2. Check if live traffic API is configured
+    key = settings.TOMTOM_TRAFFIC_API_KEY.strip() if settings.TOMTOM_TRAFFIC_API_KEY else ""
+    is_live_enabled = bool(key and key != "your_tomtom_api_key_here")
+
+    live_metrics_by_route: List[Optional[LiveTrafficMetrics]] = [None] * len(routes)
+
+    if is_live_enabled:
+        # Query TomTom live traffic independently for each candidate route concurrently
+        try:
+            async with httpx.AsyncClient(timeout=settings.TRAFFIC_TIMEOUT_SECONDS) as client:
+                tasks = [
+                    fetch_live_traffic_flow(route.coordinates, client=client)
+                    for route in routes
+                ]
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                for i, res in enumerate(results):
+                    if isinstance(res, LiveTrafficMetrics):
+                        live_metrics_by_route[i] = res
+                    elif isinstance(res, Exception):
+                        logger.warning(f"Live traffic query failed for route {routes[i].id}: {res}")
+                        live_metrics_by_route[i] = None
+                    else:
+                        live_metrics_by_route[i] = None
+        except Exception as exc:
+            logger.warning(f"Failed to query live traffic for routes: {exc}")
+            live_metrics_by_route = [None] * len(routes)
+
+    # 3. Compute route-specific traffic profile independently for each route
+    for i, route in enumerate(routes):
+        route_live_traffic = live_metrics_by_route[i]
         traffic_profile = compute_route_traffic_profile(
             route.coordinates,
             osm_roads,
-            live_traffic_metrics,
+            live_traffic=route_live_traffic,
             departure_time=departure_time,
         )
         if route.environment:
@@ -374,4 +478,6 @@ async def enrich_routes_with_traffic_data(
             if traffic_profile.status == "unavailable":
                 route.environment.notes.append("Traffic exposure data unavailable from providers.")
             elif traffic_profile.metric_type == "static_road_hierarchy_proxy":
-                route.environment.notes.append("Traffic indicator based on static road hierarchy proxy (not live volume).")
+                route.environment.notes.append(
+                    "Traffic indicator based on static road hierarchy proxy (not live volume)."
+                )

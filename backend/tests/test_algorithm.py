@@ -12,7 +12,7 @@ Covers:
 - POST /api/rank endpoint validation and responses
 """
 import pytest
-from fastapi.testclient import TestClient
+import httpx
 from app.main import app
 from app.algorithm.ranking_engine import (
     FACTOR_SPECS,
@@ -32,8 +32,6 @@ from app.schemas.environment import (
 )
 from app.schemas.preferences import PreferenceSelection, RouteRankingRequest
 from app.schemas.routes import RouteModel
-
-client = TestClient(app)
 
 
 def make_test_route(
@@ -370,7 +368,8 @@ class TestNoFixedWeightsProof:
 class TestRankingEndpoint:
     """Verifies the HTTP POST /api/rank API endpoint."""
 
-    def test_successful_rank_endpoint(self):
+    @pytest.mark.asyncio
+    async def test_successful_rank_endpoint(self, async_client: httpx.AsyncClient):
         """Posting valid routes and preferences returns 200 with complete ranking response."""
         r1 = make_test_route("route_0", "Route 1", distance_m=1000.0, eaqi=20.0).model_dump()
         r2 = make_test_route("route_1", "Route 2", distance_m=1200.0, eaqi=15.0).model_dump()
@@ -387,7 +386,7 @@ class TestRankingEndpoint:
             },
         }
 
-        res = client.post("/api/rank", json=payload)
+        res = await async_client.post("/api/rank", json=payload)
         assert res.status_code == 200
         data = res.json()
 
@@ -397,7 +396,8 @@ class TestRankingEndpoint:
         assert "comparison_matrix" in data
         assert "algorithmic_explanation" in data
 
-    def test_empty_routes_rejected(self):
+    @pytest.mark.asyncio
+    async def test_empty_routes_rejected(self, async_client: httpx.AsyncClient):
         """Posting an empty list of routes must return 422 Unprocessable Entity."""
-        res = client.post("/api/rank", json={"routes": [], "preferences": {}})
+        res = await async_client.post("/api/rank", json={"routes": [], "preferences": {}})
         assert res.status_code == 422

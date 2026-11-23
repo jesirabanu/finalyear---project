@@ -2,6 +2,7 @@
 Defines request and response models for multi-criteria route evaluation,
 Pareto-dominance analysis, metric details, and transparent recommendations.
 """
+from __future__ import annotations
 from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field
 from app.schemas.routes import RouteModel
@@ -157,13 +158,6 @@ class RouteRefreshRequest(BaseModel):
     force_refresh: bool = Field(default=True, description="Bypass cache for environmental providers")
 
 
-class RouteRefreshResponse(BaseModel):
-    """Response returning refreshed routes, updated ranking, and change explanation."""
-    routes: List[RouteModel]
-    ranking: RouteRankingResponse
-    reevaluation: ReevaluationSummary
-
-
 class RouteRankingResponse(BaseModel):
     """Complete response returned by POST /api/rank."""
     ranked_routes: List[RankedRoute] = Field(..., description="Routes ordered from best (Rank 1) to worst")
@@ -200,3 +194,10 @@ class RouteRankingResponse(BaseModel):
         default_factory=list,
         description="Operational notices regarding missing factors or withheld confidence"
     )
+
+
+class RouteRefreshResponse(BaseModel):
+    """Response returning refreshed routes, updated ranking, and change explanation."""
+    routes: List[RouteModel]
+    ranking: RouteRankingResponse
+    reevaluation: ReevaluationSummary

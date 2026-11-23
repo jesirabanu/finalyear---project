@@ -22,6 +22,12 @@ import {
   SlidersHorizontal,
   RefreshCw,
   Calendar,
+  ChevronDown,
+  ChevronUp,
+  CornerUpLeft,
+  CornerUpRight,
+  ArrowUp,
+  Milestone,
 } from 'lucide-react';
 import StatusBadge from './StatusBadge';
 import EnvironmentalPanel from './EnvironmentalPanel';
@@ -65,6 +71,7 @@ export default function Sidebar({
   const [isSearchingDest, setIsSearchingDest] = useState(false);
   const [originNoResults, setOriginNoResults] = useState(false);
   const [destNoResults, setDestNoResults] = useState(false);
+  const [expandedStepsRouteId, setExpandedStepsRouteId] = useState(null);
 
   // Synchronize state during rendering when prop changes (official React recommended pattern)
   if (origin !== prevOrigin) {
@@ -843,6 +850,109 @@ export default function Sidebar({
 
                     {/* Real Environmental Data Panel filtered by user preferences */}
                     <EnvironmentalPanel environment={route.environment} preferences={preferences} />
+
+                    {/* Turn-by-Turn Walking Directions Accordion */}
+                    <div className="route-steps-section">
+                      <button
+                        type="button"
+                        className={`route-steps-toggle ${expandedStepsRouteId === route.id ? 'open' : ''}`}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setExpandedStepsRouteId(expandedStepsRouteId === route.id ? null : route.id);
+                        }}
+                        aria-expanded={expandedStepsRouteId === route.id}
+                      >
+                        <div className="route-steps-toggle-label">
+                          <Milestone size={13} className="route-steps-icon" />
+                          <span>Walking Directions</span>
+                          {route.steps && route.steps.length > 0 && (
+                            <span className="steps-count-badge">
+                              {route.steps.length} {route.steps.length === 1 ? 'step' : 'steps'}
+                            </span>
+                          )}
+                        </div>
+                        {expandedStepsRouteId === route.id ? (
+                          <ChevronUp size={13} className="steps-chevron" />
+                        ) : (
+                          <ChevronDown size={13} className="steps-chevron" />
+                        )}
+                      </button>
+
+                      {expandedStepsRouteId === route.id && (
+                        <div className="route-steps-content" onClick={(e) => e.stopPropagation()}>
+                          {route.steps && route.steps.length > 0 ? (
+                            <ol className="route-steps-list">
+                              {route.steps.map((step, sIdx) => {
+                                const mod = (step.modifier || '').toLowerCase();
+                                const instr = (step.instruction || '').toLowerCase();
+                                const typeCode = step.type;
+
+                                let StepIcon = Compass;
+                                let iconModifierClass = 'icon-default';
+
+                                if (typeCode === 10 || mod === 'arrive' || instr.includes('arrive')) {
+                                  StepIcon = MapPin;
+                                  iconModifierClass = 'icon-arrive';
+                                } else if (typeCode === 11 || mod === 'depart' || instr.includes('depart') || instr.includes('head')) {
+                                  StepIcon = Navigation;
+                                  iconModifierClass = 'icon-depart';
+                                } else if (mod.includes('left') || instr.includes('left')) {
+                                  StepIcon = CornerUpLeft;
+                                  iconModifierClass = 'icon-left';
+                                } else if (mod.includes('right') || instr.includes('right')) {
+                                  StepIcon = CornerUpRight;
+                                  iconModifierClass = 'icon-right';
+                                } else if (mod.includes('straight') || mod.includes('continue') || instr.includes('straight') || instr.includes('continue')) {
+                                  StepIcon = ArrowUp;
+                                  iconModifierClass = 'icon-straight';
+                                } else if (mod.includes('roundabout') || typeCode === 7 || typeCode === 8) {
+                                  StepIcon = RotateCcw;
+                                  iconModifierClass = 'icon-roundabout';
+                                }
+
+                                return (
+                                  <li key={sIdx} className="route-step-item">
+                                    <div className="step-marker-col">
+                                      <span className="step-number-badge">{sIdx + 1}</span>
+                                      <span className={`step-icon-wrap ${iconModifierClass}`}>
+                                        <StepIcon size={12} />
+                                      </span>
+                                    </div>
+                                    <div className="step-details-col">
+                                      <div className="step-instruction-text">{step.instruction}</div>
+                                      <div className="step-meta-row">
+                                        {step.distance_m > 0 && (
+                                          <span className="step-meta-pill step-distance">
+                                            {step.distance_m >= 1000
+                                              ? `${(step.distance_m / 1000).toFixed(2)} km`
+                                              : `${Math.round(step.distance_m)} m`}
+                                          </span>
+                                        )}
+                                        {step.duration_s > 0 && (
+                                          <span className="step-meta-pill step-duration">
+                                            {Math.round(step.duration_s / 60) > 0
+                                              ? `~${Math.round(step.duration_s / 60)} min`
+                                              : '< 1 min'}
+                                          </span>
+                                        )}
+                                        {step.name && step.name !== '-' && (
+                                          <span className="step-meta-pill step-street">{step.name}</span>
+                                        )}
+                                      </div>
+                                    </div>
+                                  </li>
+                                );
+                              })}
+                            </ol>
+                          ) : (
+                            <div className="steps-empty-notice">
+                              <Info size={13} />
+                              <span>Detailed turn-by-turn maneuvers unavailable for this path.</span>
+                            </div>
+                          )}
+                        </div>
+                      )}
+                    </div>
 
                     <div className="route-card-footer">
                       <label className="route-select-radio">

@@ -54,3 +54,53 @@ export async function searchLocations(query, signal) {
     throw error;
   }
 }
+
+/**
+ * Reverse geocodes coordinates into a human-readable location name.
+ *
+ * @param {number} lat - Latitude in decimal degrees.
+ * @param {number} lon - Longitude in decimal degrees.
+ * @param {AbortSignal} [signal] - Optional AbortSignal to cancel obsolete requests.
+ * @returns {Promise<{placeId?: number, displayName: string, lat: number, lon: number, address?: Object}|null>}
+ */
+export async function reverseGeocode(lat, lon, signal) {
+  if (typeof lat !== 'number' || typeof lon !== 'number') {
+    throw new Error('Valid numerical latitude and longitude are required.');
+  }
+
+  const endpoint = `/api/geocode/reverse?lat=${encodeURIComponent(lat)}&lon=${encodeURIComponent(lon)}`;
+
+  try {
+    const response = await fetch(endpoint, {
+      method: 'GET',
+      headers: {
+        'Accept': 'application/json',
+      },
+      signal,
+    });
+
+    if (!response.ok) {
+      if (response.status === 429) {
+        throw new Error('Geocoding rate limit reached. Please wait a moment.');
+      }
+      const errorData = await response.json().catch(() => ({}));
+      throw new Error(errorData.detail || `Reverse geocoding failed with status ${response.status}`);
+    }
+
+    const data = await response.json();
+    return {
+      placeId: data.place_id,
+      displayName: data.display_name,
+      lat: data.lat,
+      lon: data.lon,
+      address: data.address,
+    };
+  } catch (error) {
+    if (error.name === 'AbortError') {
+      return null;
+    }
+    console.error('Reverse geocoding service error:', error);
+    throw error;
+  }
+}
+

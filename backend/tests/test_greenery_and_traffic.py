@@ -9,9 +9,12 @@ Covers:
 - Verification that road classification is never labeled as live traffic
 - Integration into multi-criteria ranking engine (greenery higher-is-better, traffic lower-is-better)
 """
+import time
 from typing import Any, Dict, List
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
+import httpx
 import pytest
+from app.core.config import settings
 from app.algorithm.ranking_engine import rank_routes
 from app.schemas.environment import (
     AirQualityData,
@@ -34,8 +37,12 @@ from app.services.greenery_service import (
 )
 from app.services.traffic_service import (
     compute_route_traffic_profile,
+    enrich_routes_with_traffic_data,
+    extract_representative_traffic_points,
     fetch_live_traffic_flow,
     fetch_overpass_major_roads,
+    query_tomtom_traffic_point,
+    _tomtom_traffic_cache,
 )
 
 
@@ -303,3 +310,261 @@ class TestRankingIntegrationWithGreeneryAndTraffic:
         assert "greenery" in res.missing_selected_factors
         assert "walking_distance" in res.active_evaluation_factors
         assert res.ranked_routes[0].id == "r1"
+
+
+def make_candidate_route(
+    route_id: str,
+    coordinates: List[List[float]],
+    distance_m: float = 1000.0,
+) -> RouteModel:
+    """Helper to construct basic candidate RouteModel for enrichment tests."""
+    aq = AirQualityData(
+        european_aqi=PollutantReading(value=25.0, unit="EAQI", status="available")
+    )
+    wx = WeatherData(temperature_c=20.0, apparent_temperature_c=19.5)
+    meta = EnvironmentalMetadata(retrieval_timestamp="2026-10-22T12:00:00Z")
+    env = RouteEnvironmentalSummary(
+        air_quality=aq,
+        weather=wx,
+        metadata=meta,
+        samples_count=len(coordinates),
+        has_air_quality=True,
+        has_weather=True,
+        has_greenery=False,
+        has_traffic=False,
+    )
+    return RouteModel(
+        id=route_id,
+        name=f"Route {route_id}",
+        distance_m=distance_m,
+        distance_km=round(distance_m / 1000.0, 2),
+        duration_s=round(distance_m / 1.4, 1),
+        duration_min=round(distance_m / 84.0, 1),
+        coordinates=coordinates,
+        environment=env,
+        available_environmental_metrics={"walking_distance": distance_m},
+        metric_units={"walking_distance": "m"},
+        data_quality_status="partial_data",
+    )
+
+
+class TestPerRouteTrafficIsolation:
+    """Verifies that each candidate route receives traffic metrics derived from its own geometry."""
+
+    @pytest.mark.asyncio
+    async def test_candidate_routes_receive_independent_traffic_metrics(self):
+        """Candidate routes with different coordinates receive independent traffic scores."""
+        coords_0 = [[51.5138, -0.0984], [51.5110, -0.0870], [51.5081, -0.0759]]
+        coords_1 = [[51.5138, -0.0984], [51.5250, -0.0850], [51.5081, -0.0759]]
+
+        r0 = make_candidate_route("r0", coords_0, distance_m=1200.0)
+        r1 = make_candidate_route("r1", coords_1, distance_m=1400.0)
+
+        async def mock_get(url, *args, **kwargs):
+            mock_resp = MagicMock()
+            mock_resp.status_code = 200
+            if "51.511" in str(url):
+                mock_resp.json.return_value = {
+                    "flowSegmentData": {"currentSpeed": 15, "freeFlowSpeed": 50}
+                }
+            elif "51.525" in str(url):
+                mock_resp.json.return_value = {
+                    "flowSegmentData": {"currentSpeed": 45, "freeFlowSpeed": 50}
+                }
+            else:
+                mock_resp.json.return_value = {
+                    "flowSegmentData": {"currentSpeed": 30, "freeFlowSpeed": 50}
+                }
+            return mock_resp
+
+        with patch.object(settings, "TOMTOM_TRAFFIC_API_KEY", "test_valid_key"), \
+             patch("httpx.AsyncClient.get", new_callable=AsyncMock, side_effect=mock_get), \
+             patch("app.services.traffic_service.fetch_overpass_major_roads", new_callable=AsyncMock, return_value=[]):
+            _tomtom_traffic_cache.clear()
+            await enrich_routes_with_traffic_data([r0, r1])
+
+            assert r0.environment.traffic_exposure.score == 70.0
+            assert r0.environment.traffic_exposure.is_live_measurement is True
+            assert r1.environment.traffic_exposure.score == 10.0
+            assert r1.environment.traffic_exposure.is_live_measurement is True
+            assert r0.environment.traffic_exposure.score != r1.environment.traffic_exposure.score
+
+    @pytest.mark.asyncio
+    async def test_route_0_metrics_never_reused_for_other_routes(self):
+        """Alternative routes must never inherit Route 0's traffic metrics."""
+        coords_0 = [[51.5138, -0.0984], [51.5100, -0.0800]]
+        coords_1 = [[51.5138, -0.0984], [51.5300, -0.0800]]
+        r0 = make_candidate_route("r0", coords_0)
+        r1 = make_candidate_route("r1", coords_1)
+
+        metric_0 = LiveTrafficMetrics(congestion_pct=85.0, current_speed_kmh=10.0, free_flow_speed_kmh=60.0, status="available")
+        metric_1 = LiveTrafficMetrics(congestion_pct=15.0, current_speed_kmh=51.0, free_flow_speed_kmh=60.0, status="available")
+
+        with patch.object(settings, "TOMTOM_TRAFFIC_API_KEY", "test_key"), \
+             patch("app.services.traffic_service.fetch_live_traffic_flow", new_callable=AsyncMock, side_effect=[metric_0, metric_1]), \
+             patch("app.services.traffic_service.fetch_overpass_major_roads", new_callable=AsyncMock, return_value=[]):
+            await enrich_routes_with_traffic_data([r0, r1])
+
+            assert r0.environment.traffic_exposure.live_traffic.congestion_pct == 85.0
+            assert r1.environment.traffic_exposure.live_traffic.congestion_pct == 15.0
+            assert r0.environment.traffic_exposure.score != r1.environment.traffic_exposure.score
+
+
+class TestTrafficFallback:
+    """Verifies fallback behaviour when TomTom live traffic is missing, fails, or is unavailable."""
+
+    @pytest.mark.asyncio
+    async def test_fallback_when_credentials_missing(self):
+        """When TOMTOM_TRAFFIC_API_KEY is missing, routes independently calculate static road hierarchy proxy."""
+        coords_a = [[51.5138, -0.0984], [51.5110, -0.0870], [51.5081, -0.0759]]
+        coords_b = [[51.5138, -0.0984], [51.5250, -0.0850], [51.5081, -0.0759]]
+        r_a = make_candidate_route("r_a", coords_a)
+        r_b = make_candidate_route("r_b", coords_b)
+
+        mock_osm_roads = [
+            {
+                "type": "way",
+                "id": 101,
+                "center": {"lat": 51.5111, "lon": -0.0871},
+                "tags": {"highway": "primary", "name": "Main Arterial"},
+            }
+        ]
+
+        with patch.object(settings, "TOMTOM_TRAFFIC_API_KEY", ""), \
+             patch("app.services.traffic_service.fetch_overpass_major_roads", new_callable=AsyncMock, return_value=mock_osm_roads):
+            await enrich_routes_with_traffic_data([r_a, r_b])
+
+            assert r_a.environment.traffic_exposure.metric_type == "static_road_hierarchy_proxy"
+            assert r_a.environment.traffic_exposure.is_live_measurement is False
+            assert r_b.environment.traffic_exposure.metric_type == "static_road_hierarchy_proxy"
+            assert r_b.environment.traffic_exposure.is_live_measurement is False
+            assert r_a.environment.traffic_exposure.score > r_b.environment.traffic_exposure.score
+
+    @pytest.mark.asyncio
+    async def test_fallback_when_tomtom_returns_empty_data(self):
+        """Empty TomTom flow data falls back to static proxy."""
+        r = make_candidate_route("r", [[51.51, -0.09], [51.52, -0.09]])
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"flowSegmentData": {}}
+
+        with patch.object(settings, "TOMTOM_TRAFFIC_API_KEY", "test_key"), \
+             patch("httpx.AsyncClient.get", new_callable=AsyncMock, return_value=mock_resp), \
+             patch("app.services.traffic_service.fetch_overpass_major_roads", new_callable=AsyncMock, return_value=[]):
+            _tomtom_traffic_cache.clear()
+            await enrich_routes_with_traffic_data([r])
+
+            assert r.environment.traffic_exposure.metric_type == "static_road_hierarchy_proxy"
+            assert r.environment.traffic_exposure.is_live_measurement is False
+
+    @pytest.mark.asyncio
+    async def test_fallback_when_tomtom_times_out(self):
+        """Timeout connecting to TomTom falls back to static proxy without crashing."""
+        r = make_candidate_route("r", [[51.51, -0.09], [51.52, -0.09]])
+
+        with patch.object(settings, "TOMTOM_TRAFFIC_API_KEY", "test_key"), \
+             patch("httpx.AsyncClient.get", new_callable=AsyncMock, side_effect=httpx.TimeoutException("Timeout")), \
+             patch("app.services.traffic_service.fetch_overpass_major_roads", new_callable=AsyncMock, return_value=[]):
+            _tomtom_traffic_cache.clear()
+            await enrich_routes_with_traffic_data([r])
+
+            assert r.environment.traffic_exposure.metric_type == "static_road_hierarchy_proxy"
+            assert r.environment.traffic_exposure.is_live_measurement is False
+
+    @pytest.mark.asyncio
+    async def test_fallback_when_tomtom_http_error(self):
+        """TomTom HTTP errors (e.g. 500) fall back to static proxy."""
+        r = make_candidate_route("r", [[51.51, -0.09], [51.52, -0.09]])
+        mock_resp = MagicMock()
+        mock_resp.status_code = 500
+
+        with patch.object(settings, "TOMTOM_TRAFFIC_API_KEY", "test_key"), \
+             patch("httpx.AsyncClient.get", new_callable=AsyncMock, return_value=mock_resp), \
+             patch("app.services.traffic_service.fetch_overpass_major_roads", new_callable=AsyncMock, return_value=[]):
+            _tomtom_traffic_cache.clear()
+            await enrich_routes_with_traffic_data([r])
+
+            assert r.environment.traffic_exposure.metric_type == "static_road_hierarchy_proxy"
+            assert r.environment.traffic_exposure.is_live_measurement is False
+
+    @pytest.mark.asyncio
+    async def test_one_route_fails_while_other_succeeds(self):
+        """When one route's live query fails, it falls back to static proxy while the other retains live traffic."""
+        r0 = make_candidate_route("r0", [[51.51, -0.09], [51.52, -0.09]])
+        r1 = make_candidate_route("r1", [[51.53, -0.08], [51.54, -0.08]])
+
+        metric_0 = LiveTrafficMetrics(congestion_pct=55.0, current_speed_kmh=20.0, free_flow_speed_kmh=45.0, status="available")
+
+        with patch.object(settings, "TOMTOM_TRAFFIC_API_KEY", "test_key"), \
+             patch("app.services.traffic_service.fetch_live_traffic_flow", new_callable=AsyncMock, side_effect=[metric_0, Exception("Network error")]), \
+             patch("app.services.traffic_service.fetch_overpass_major_roads", new_callable=AsyncMock, return_value=[]):
+            await enrich_routes_with_traffic_data([r0, r1])
+
+            assert r0.environment.traffic_exposure.is_live_measurement is True
+            assert r0.environment.traffic_exposure.score == 55.0
+
+            assert r1.environment.traffic_exposure.is_live_measurement is False
+            assert r1.environment.traffic_exposure.metric_type == "static_road_hierarchy_proxy"
+            assert r1.environment.traffic_exposure.score == 15.0
+
+
+class TestTrafficApiEfficiency:
+    """Verifies caching and request budget constraints."""
+
+    @pytest.mark.asyncio
+    async def test_duplicate_sampling_coordinates_reuse_cached_results(self):
+        """Repeated queries for the same coordinates serve from cache without making external HTTP requests."""
+        _tomtom_traffic_cache.clear()
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "flowSegmentData": {"currentSpeed": 35, "freeFlowSpeed": 50}
+        }
+
+        with patch.object(settings, "TOMTOM_TRAFFIC_API_KEY", "test_key"), \
+             patch("httpx.AsyncClient.get", new_callable=AsyncMock, return_value=mock_resp) as mock_get:
+            res1 = await query_tomtom_traffic_point(51.5138, -0.0984)
+            assert mock_get.call_count == 1
+            assert res1["congestion_pct"] == 30.0
+
+            res2 = await query_tomtom_traffic_point(51.5138, -0.0984)
+            assert mock_get.call_count == 1
+            assert res2["congestion_pct"] == 30.0
+
+    def test_sampling_stays_within_budget(self):
+        """Representative points extractor returns at most 2 points even for long routes."""
+        long_coords = [[51.5 + i * 0.001, -0.1 + i * 0.001] for i in range(100)]
+        pts = extract_representative_traffic_points(long_coords, max_points=2)
+        assert len(pts) <= 2
+
+
+class TestTrafficRankingVarianceAndIntegration:
+    """Verifies that route-specific traffic measurements differentiate routes in the ranking engine."""
+
+    def test_different_traffic_measurements_distinguishable_when_normalized(self):
+        """Different traffic scores normalize to 1.0 (best) and 0.0 (worst) rather than both collapsing to 1.0."""
+        t_low = TrafficExposureData(score=20.0, unit="index (0-100)", status="live_measured", is_live_measurement=True)
+        t_high = TrafficExposureData(score=80.0, unit="index (0-100)", status="live_measured", is_live_measurement=True)
+
+        r_low = make_route_with_custom_env("r_low", distance_m=1000.0, traffic=t_low)
+        r_high = make_route_with_custom_env("r_high", distance_m=1000.0, traffic=t_high)
+
+        res = rank_routes([r_low, r_high], PreferenceSelection(traffic_exposure=True))
+
+        assert res.ranked_routes[0].id == "r_low"
+        assert res.ranked_routes[0].factor_details["traffic_exposure"].normalized_score == 1.0
+        assert res.ranked_routes[1].factor_details["traffic_exposure"].normalized_score == 0.0
+
+    def test_identical_traffic_measurements_do_not_produce_artificial_differences(self):
+        """Genuinely identical traffic measurements both receive 1.0 without artificial manipulation."""
+        t_same1 = TrafficExposureData(score=35.0, unit="index (0-100)", status="live_measured", is_live_measurement=True)
+        t_same2 = TrafficExposureData(score=35.0, unit="index (0-100)", status="live_measured", is_live_measurement=True)
+
+        r1 = make_route_with_custom_env("r1", distance_m=1000.0, traffic=t_same1)
+        r2 = make_route_with_custom_env("r2", distance_m=1000.0, traffic=t_same2)
+
+        res = rank_routes([r1, r2], PreferenceSelection(traffic_exposure=True))
+
+        assert res.ranked_routes[0].factor_details["traffic_exposure"].normalized_score == 1.0
+        assert res.ranked_routes[1].factor_details["traffic_exposure"].normalized_score == 1.0
+

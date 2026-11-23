@@ -4,7 +4,7 @@ configurable cache expiry, and re-evaluation change tracking.
 from datetime import datetime, timezone, timedelta
 import pytest
 from unittest.mock import patch, MagicMock, AsyncMock
-from fastapi.testclient import TestClient
+import httpx
 
 from app.main import app
 from app.core.config import settings
@@ -29,8 +29,6 @@ from app.algorithm.ranking_engine import (
     compute_reevaluation_summary,
 )
 from app.services.routing_service import refresh_route_environments
-
-client = TestClient(app)
 
 
 def _make_dummy_route(
@@ -209,9 +207,10 @@ class TestReevaluationChangeTracking:
 class TestRefreshEndpoint:
     """Integration test for POST /api/routes/refresh endpoint."""
 
+    @pytest.mark.asyncio
     @patch("app.services.routing_service.enrich_routes_with_environmental_data")
     @patch("app.services.routing_service.enrich_routes_with_traffic_data")
-    def test_routes_refresh_endpoint(self, mock_traffic, mock_env):
+    async def test_routes_refresh_endpoint(self, mock_traffic, mock_env, async_client: httpx.AsyncClient):
         """Calling /api/routes/refresh re-evaluates routes and returns ReevaluationSummary."""
         r1 = _make_dummy_route("r1", "Route A", distance_m=1000.0)
         payload = {
@@ -221,7 +220,7 @@ class TestRefreshEndpoint:
             "force_refresh": True,
         }
 
-        res = client.post("/api/routes/refresh", json=payload)
+        res = await async_client.post("/api/routes/refresh", json=payload)
         assert res.status_code == 200
         data = res.json()
         assert "routes" in data

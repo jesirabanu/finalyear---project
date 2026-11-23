@@ -9,7 +9,7 @@ Covers:
 """
 import pytest
 from unittest.mock import patch, MagicMock, AsyncMock
-from fastapi.testclient import TestClient
+import httpx
 from app.main import app
 from app.services.environmental_service import (
     sample_route_geometry,
@@ -20,8 +20,6 @@ from app.services.environmental_service import (
     _get_wmo_description,
 )
 from app.schemas.environment import RouteEnvironmentalPoint
-
-client = TestClient(app)
 
 MOCK_AQ_CURRENT_RESPONSE = {
     "latitude": 51.51,
@@ -211,28 +209,31 @@ class TestRouteSummaryComputation:
 class TestEnvironmentEndpoint:
     """Tests for GET /api/environment endpoint."""
 
-    def test_invalid_coordinates(self):
+    @pytest.mark.asyncio
+    async def test_invalid_coordinates(self, async_client: httpx.AsyncClient):
         """Out of bounds latitude or longitude returns 422."""
-        res = client.get("/api/environment?lat=95.0&lon=0.0")
+        res = await async_client.get("/api/environment?lat=95.0&lon=0.0")
         assert res.status_code == 422
 
-        res2 = client.get("/api/environment?lat=0.0&lon=200.0")
+        res2 = await async_client.get("/api/environment?lat=0.0&lon=200.0")
         assert res2.status_code == 422
 
-    def test_invalid_iso_time_format(self):
+    @pytest.mark.asyncio
+    async def test_invalid_iso_time_format(self, async_client: httpx.AsyncClient):
         """Malformed timestamp string returns 400."""
-        res = client.get("/api/environment?lat=51.5&lon=-0.1&time=not-a-date")
+        res = await async_client.get("/api/environment?lat=51.5&lon=-0.1&time=not-a-date")
         assert res.status_code == 400
         assert "Invalid time format" in res.json()["detail"]
 
+    @pytest.mark.asyncio
     @patch("app.services.environmental_service.fetch_air_quality_batch")
     @patch("app.services.environmental_service.fetch_weather_batch")
-    def test_successful_point_environment(self, mock_wx_batch, mock_aq_batch):
+    async def test_successful_point_environment(self, mock_wx_batch, mock_aq_batch, async_client: httpx.AsyncClient):
         """Valid query returns structured air quality and weather data."""
         mock_aq_batch.return_value = [MOCK_AQ_CURRENT_RESPONSE]
         mock_wx_batch.return_value = [MOCK_WEATHER_CURRENT_RESPONSE]
 
-        res = client.get("/api/environment?lat=51.5138&lon=-0.0984")
+        res = await async_client.get("/api/environment?lat=51.5138&lon=-0.0984")
         assert res.status_code == 200
 
         data = res.json()

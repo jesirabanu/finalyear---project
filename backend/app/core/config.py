@@ -19,6 +19,7 @@ class Settings(BaseSettings):
     OVERPASS_TIMEOUT_SECONDS: float = 10.0
     OVERPASS_CACHE_TTL_SECONDS: int = 900
     NOMINATIM_API_URL: str = "https://nominatim.openstreetmap.org/search"
+    NOMINATIM_REVERSE_API_URL: str = "https://nominatim.openstreetmap.org/reverse"
     NOMINATIM_USER_AGENT: str = "EcoWalk-PedestrianRouting/1.0 (academic-pedestrian-routing)"
     
     # Optional Live Traffic API (TomTom Traffic Flow API)
